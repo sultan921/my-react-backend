@@ -42,6 +42,6 @@ app.get("/", (req, res) => {
 // ==========================
 // Server Initialization
 // ==========================
-app.listen(PORT, "8.0.8.0", () => {
+app.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Server is running smoothly on port ${PORT}`);
 });
