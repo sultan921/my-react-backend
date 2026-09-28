@@ -42,6 +42,9 @@ app.get("/", (req, res) => {
 // ==========================
 // Server Initialization
 // ==========================
-app.listen(PORT, () => {
+// Server Listen - Railway / Cloud Ready
+const PORT = process.env.PORT || 8080;
+
+app.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Server is running smoothly on port ${PORT}`);
 });
