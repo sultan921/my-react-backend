@@ -26,7 +26,7 @@ mongoose.connect(MONGO_URI)
   })
   .catch((err) => {
     console.error("❌ MongoDB Connection Error:", err.message);
-    process.exit(1); // Agar database connect na ho toh server rokh dein
+    process.exit(1);
   });
 
 // ==========================
@@ -42,9 +42,6 @@ app.get("/", (req, res) => {
 // ==========================
 // Server Initialization
 // ==========================
-// Server Listen - Railway / Cloud Ready
-const PORT = process.env.PORT || 8080;
-
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Server is running smoothly on port ${PORT}`);
 });
