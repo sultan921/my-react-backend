@@ -11,6 +11,7 @@ const server = http.createServer(app);
 // ==========================
 // Socket.io Setup
 // ==========================
+
 const io = new Server(server, {
   cors: {
     origin: "*",
@@ -21,19 +22,23 @@ const io = new Server(server, {
 // ==========================
 // Middleware
 // ==========================
+
 app.use(express.json());
 app.use(cors());
 
 // ==========================
 // Environment Variables & Port
 // ==========================
+
 const PORT = process.env.PORT || 8080;
 const MONGO_URI = process.env.MONGO_URI;
 
 // ==========================
 // MongoDB Connection
 // ==========================
-mongoose.connect(MONGO_URI)
+
+mongoose
+  .connect(MONGO_URI)
   .then(() => {
     console.log("✅ Successfully connected to MongoDB Atlas");
   })
@@ -45,6 +50,7 @@ mongoose.connect(MONGO_URI)
 // ==========================
 // User Schema & Model
 // ==========================
+
 const userSchema = new mongoose.Schema({
   name: {
     type: String,
@@ -73,6 +79,7 @@ const User = mongoose.model("User", userSchema);
 // ==========================
 // API Routes - Signup
 // ==========================
+
 app.post("/api/auth/signup", async (req, res) => {
   try {
     const { name, phone, password } = req.body;
@@ -105,22 +112,19 @@ app.post("/api/auth/signup", async (req, res) => {
         coins: newUser.coins
       }
     });
-
   } catch (err) {
-
     res.status(500).json({
       error: "Server error: " + err.message
     });
-
   }
 });
 
 // ==========================
 // API Routes - Login
 // ==========================
+
 app.post("/api/auth/login", async (req, res) => {
   try {
-
     const { phone, password } = req.body;
 
     const user = await User.findOne({ phone });
@@ -148,26 +152,22 @@ app.post("/api/auth/login", async (req, res) => {
         coins: user.coins
       }
     });
-
   } catch (err) {
-
     res.status(500).json({
       error: "Server error: " + err.message
     });
-
   }
 });
 
 // ==========================
 // Root Route
 // ==========================
-app.get("/", (req, res) => {
 
+app.get("/", (req, res) => {
   res.status(200).json({
     success: true,
     message: "🚀 SAMATKAAR Backend is running successfully!"
   });
-
 });
 
 // ======================================================
@@ -183,12 +183,14 @@ const onlinePlayers = new Map();
 // Socket -> User relation
 const socketToUser = new Map();
 
+// Pending direct challenges
+const pendingChallenges = new Map();
+
 // ======================================================
 // HELPER FUNCTIONS
 // ======================================================
 
 function normalizeId(value) {
-
   if (value === undefined || value === null) {
     return "";
   }
@@ -199,27 +201,24 @@ function normalizeId(value) {
 // ------------------------------------------------------
 // Remove player from matchmaking queue
 // ------------------------------------------------------
-function removeFromQueue(socketId) {
 
+function removeFromQueue(socketId) {
   waitingQueue = waitingQueue.filter(
     (player) => player.socketId !== socketId
   );
-
 }
 
 // ------------------------------------------------------
 // Find online player using MongoDB User ID
 // ------------------------------------------------------
-function getOnlinePlayerByUserId(userId) {
 
+function getOnlinePlayerByUserId(userId) {
   const targetId = normalizeId(userId);
 
   for (const player of onlinePlayers.values()) {
-
     if (normalizeId(player.userId) === targetId) {
       return player;
     }
-
   }
 
   return null;
@@ -228,10 +227,9 @@ function getOnlinePlayerByUserId(userId) {
 // ------------------------------------------------------
 // Generate unique room ID
 // ------------------------------------------------------
+
 function makeRoomId(prefix, socketA, socketB) {
-
   return `${prefix}_${Date.now()}_${socketA}_${socketB}`;
-
 }
 
 // ======================================================
@@ -239,7 +237,6 @@ function makeRoomId(prefix, socketA, socketB) {
 // ======================================================
 
 io.on("connection", (socket) => {
-
   console.log(
     "✅ Ek user successfully connect ho gaya:",
     socket.id
@@ -250,13 +247,10 @@ io.on("connection", (socket) => {
   // ====================================================
 
   socket.on("register_player", async (data = {}) => {
-
     try {
-
       const userId = normalizeId(data.userId);
 
       if (!userId) {
-
         socket.emit("realtime_error", {
           message: "User ID missing hai."
         });
@@ -267,15 +261,12 @@ io.on("connection", (socket) => {
       let dbUser = null;
 
       if (mongoose.Types.ObjectId.isValid(userId)) {
-
         dbUser = await User
           .findById(userId)
           .select("_id name coins");
-
       }
 
       if (!dbUser) {
-
         socket.emit("realtime_error", {
           message: "User database mein nahi mila."
         });
@@ -284,13 +275,9 @@ io.on("connection", (socket) => {
       }
 
       const player = {
-
         socketId: socket.id,
-
         userId: normalizeId(dbUser._id),
-
         userName: dbUser.name,
-
         coins: dbUser.coins,
 
         profilePic:
@@ -298,13 +285,9 @@ io.on("connection", (socket) => {
           data.profileImage ||
           data.avatar ||
           ""
-
       };
 
-      onlinePlayers.set(
-        socket.id,
-        player
-      );
+      onlinePlayers.set(socket.id, player);
 
       socketToUser.set(
         socket.id,
@@ -312,19 +295,14 @@ io.on("connection", (socket) => {
       );
 
       socket.emit("player_registered", {
-
         success: true,
-
         player
-
       });
 
       console.log(
         `🟢 Online: ${player.userName} (${player.userId})`
       );
-
     } catch (err) {
-
       console.error(
         "register_player error:",
         err
@@ -333,9 +311,7 @@ io.on("connection", (socket) => {
       socket.emit("realtime_error", {
         message: "Player register nahi ho saka."
       });
-
     }
-
   });
 
   // ====================================================
@@ -343,9 +319,7 @@ io.on("connection", (socket) => {
   // ====================================================
 
   socket.on("search_players", async (data = {}) => {
-
     try {
-
       const query = String(
         data.query ||
         data.search ||
@@ -354,27 +328,27 @@ io.on("connection", (socket) => {
       ).trim();
 
       if (!query) {
-
         socket.emit("search_players_result", {
+          players: []
+        });
+
+        socket.emit("player_search_results", {
           players: []
         });
 
         return;
       }
 
-      // Regex special characters escape
       const safeQuery = query.replace(
         /[.*+?^${}()|[\]\\]/g,
         "\\$&"
       );
 
       const users = await User.find({
-
         name: {
           $regex: safeQuery,
           $options: "i"
         }
-
       })
         .select("_id name coins")
         .limit(20)
@@ -384,10 +358,7 @@ io.on("connection", (socket) => {
         onlinePlayers.get(socket.id);
 
       const players = users
-
-        // Apna account search result mein na dikhao
         .filter((user) => {
-
           if (!requester) {
             return true;
           }
@@ -396,25 +367,17 @@ io.on("connection", (socket) => {
             normalizeId(user._id) !==
             normalizeId(requester.userId)
           );
-
         })
 
         .map((user) => {
-
           const online =
-            getOnlinePlayerByUserId(
-              user._id
-            );
+            getOnlinePlayerByUserId(user._id);
 
           return {
-
             id: normalizeId(user._id),
-
-            userId:
-              normalizeId(user._id),
+            userId: normalizeId(user._id),
 
             name: user.name,
-
             userName: user.name,
 
             coins: user.coins,
@@ -430,35 +393,44 @@ io.on("connection", (socket) => {
               online
                 ? online.profilePic || ""
                 : ""
-
           };
-
         });
+
+      /*
+        IMPORTANT FIX:
+        Old + new frontend dono event names support.
+      */
 
       socket.emit(
         "search_players_result",
-        {
-          players
-        }
+        { players }
       );
 
+      socket.emit(
+        "player_search_results",
+        { players }
+      );
     } catch (err) {
-
       console.error(
         "search_players error:",
         err
       );
 
+      const errorPayload = {
+        players: [],
+        error: "Players search nahi ho sake."
+      };
+
       socket.emit(
         "search_players_result",
-        {
-          players: [],
-          error: "Players search nahi ho sake."
-        }
+        errorPayload
       );
 
+      socket.emit(
+        "player_search_results",
+        errorPayload
+      );
     }
-
   });
 
   // ====================================================
@@ -468,12 +440,10 @@ io.on("connection", (socket) => {
   socket.on(
     "send_friend_request",
     (data = {}) => {
-
       const sender =
         onlinePlayers.get(socket.id);
 
       if (!sender) {
-
         socket.emit(
           "friend_request_error",
           {
@@ -485,9 +455,16 @@ io.on("connection", (socket) => {
         return;
       }
 
-      const targetUserId =
+      /*
+        FIX:
+        Frontend toUserId bhej raha tha.
+        Backend targetUserId expect kar raha tha.
+        Ab dono supported.
+      */
 
+      const targetUserId =
         data.targetUserId ||
+        data.toUserId ||
         data.receiverId ||
         data.userId;
 
@@ -497,7 +474,6 @@ io.on("connection", (socket) => {
         );
 
       if (!target) {
-
         socket.emit(
           "friend_request_error",
           {
@@ -509,11 +485,7 @@ io.on("connection", (socket) => {
         return;
       }
 
-      if (
-        target.socketId ===
-        socket.id
-      ) {
-
+      if (target.socketId === socket.id) {
         socket.emit(
           "friend_request_error",
           {
@@ -528,32 +500,22 @@ io.on("connection", (socket) => {
       io.to(target.socketId).emit(
         "friend_request_received",
         {
-
           from: {
-
             id: sender.userId,
+            userId: sender.userId,
 
-            userId:
-              sender.userId,
-
-            name:
-              sender.userName,
-
-            userName:
-              sender.userName,
+            name: sender.userName,
+            userName: sender.userName,
 
             profilePic:
               sender.profilePic || ""
-
           }
-
         }
       );
 
       socket.emit(
         "friend_request_sent",
         {
-
           success: true,
 
           targetUserId:
@@ -561,10 +523,8 @@ io.on("connection", (socket) => {
 
           message:
             `${target.userName} ko friend request bhej di gayi.`
-
         }
       );
-
     }
   );
 
@@ -575,12 +535,10 @@ io.on("connection", (socket) => {
   socket.on(
     "challenge_player",
     (data = {}) => {
-
       const sender =
         onlinePlayers.get(socket.id);
 
       if (!sender) {
-
         socket.emit(
           "challenge_error",
           {
@@ -592,9 +550,14 @@ io.on("connection", (socket) => {
         return;
       }
 
-      const targetUserId =
+      /*
+        FIX:
+        toUserId bhi accept hoga.
+      */
 
+      const targetUserId =
         data.targetUserId ||
+        data.toUserId ||
         data.opponentId ||
         data.receiverId;
 
@@ -604,7 +567,6 @@ io.on("connection", (socket) => {
         );
 
       if (!target) {
-
         socket.emit(
           "challenge_error",
           {
@@ -616,11 +578,7 @@ io.on("connection", (socket) => {
         return;
       }
 
-      if (
-        target.socketId ===
-        socket.id
-      ) {
-
+      if (target.socketId === socket.id) {
         socket.emit(
           "challenge_error",
           {
@@ -646,19 +604,52 @@ io.on("connection", (socket) => {
       const challengeId =
         `challenge_${Date.now()}_${socket.id}_${target.socketId}`;
 
+      /*
+        FIX:
+        Challenge ko backend memory mein save karo.
+        Is se Accept button ko sirf challengeId bhejna
+        pade to bhi backend original challenger,
+        game aur bet identify kar lega.
+      */
+
+      pendingChallenges.set(
+        challengeId,
+        {
+          challengeId,
+
+          challengerUserId:
+            sender.userId,
+
+          targetUserId:
+            target.userId,
+
+          game,
+          betCoins,
+
+          createdAt: Date.now()
+        }
+      );
+
       // Opponent ko challenge bhejo
+
       io.to(target.socketId).emit(
         "challenge_received",
         {
-
           challengeId,
 
-          game,
+          challengerUserId:
+            sender.userId,
 
+          fromUserId:
+            sender.userId,
+
+          fromName:
+            sender.userName,
+
+          game,
           betCoins,
 
           challenger: {
-
             id:
               sender.userId,
 
@@ -676,38 +667,35 @@ io.on("connection", (socket) => {
 
             profilePic:
               sender.profilePic || ""
-
           }
-
         }
       );
 
-      // Sender ko confirmation
+      // Sender confirmation
+
       socket.emit(
         "challenge_sent",
         {
-
           success: true,
 
           challengeId,
 
           game,
-
           betCoins,
 
           opponent: {
-
             id:
               target.userId,
 
             name:
               target.userName
-
           }
-
         }
       );
 
+      console.log(
+        `⚔️ Challenge: ${sender.userName} -> ${target.userName} | ${game} | ${betCoins}`
+      );
     }
   );
 
@@ -718,12 +706,10 @@ io.on("connection", (socket) => {
   socket.on(
     "accept_challenge",
     (data = {}) => {
-
       const acceptingPlayer =
         onlinePlayers.get(socket.id);
 
       if (!acceptingPlayer) {
-
         socket.emit(
           "challenge_error",
           {
@@ -735,12 +721,21 @@ io.on("connection", (socket) => {
         return;
       }
 
+      /*
+        Challenge ID se original challenge retrieve.
+      */
+
+      const savedChallenge =
+        data.challengeId
+          ? pendingChallenges.get(
+              data.challengeId
+            )
+          : null;
+
       const challengerUserId =
-
         data.challengerUserId ||
-
+        savedChallenge?.challengerUserId ||
         data.fromUserId ||
-
         (
           data.challenger &&
           (
@@ -755,7 +750,6 @@ io.on("connection", (socket) => {
         );
 
       if (!challenger) {
-
         socket.emit(
           "challenge_error",
           {
@@ -770,12 +764,16 @@ io.on("connection", (socket) => {
       const game = String(
         data.game ||
         data.gameType ||
+        savedChallenge?.game ||
         "ludo"
       ).toLowerCase();
 
       const betCoins = Math.max(
         0,
-        Number(data.betCoins) || 0
+        Number(
+          data.betCoins ??
+          savedChallenge?.betCoins
+        ) || 0
       );
 
       const roomId =
@@ -791,7 +789,6 @@ io.on("connection", (socket) => {
         );
 
       if (!challengerSocket) {
-
         socket.emit(
           "challenge_error",
           {
@@ -802,6 +799,10 @@ io.on("connection", (socket) => {
 
         return;
       }
+
+      /*
+        BOTH PLAYERS SAME SOCKET.IO ROOM
+      */
 
       challengerSocket.join(
         roomId
@@ -820,7 +821,6 @@ io.on("connection", (socket) => {
       );
 
       const matchData = {
-
         roomId,
 
         game,
@@ -831,7 +831,6 @@ io.on("connection", (socket) => {
           "challenge",
 
         player1: {
-
           id:
             challenger.userId,
 
@@ -843,11 +842,9 @@ io.on("connection", (socket) => {
 
           profilePic:
             challenger.profilePic || ""
-
         },
 
         player2: {
-
           id:
             acceptingPlayer.userId,
 
@@ -859,10 +856,12 @@ io.on("connection", (socket) => {
 
           profilePic:
             acceptingPlayer.profilePic || ""
-
         }
-
       };
+
+      /*
+        Dono users ko same match information.
+      */
 
       io.to(roomId).emit(
         "challenge_accepted",
@@ -874,10 +873,15 @@ io.on("connection", (socket) => {
         matchData
       );
 
+      if (data.challengeId) {
+        pendingChallenges.delete(
+          data.challengeId
+        );
+      }
+
       console.log(
         `⚔️ Challenge accepted: ${challenger.userName} VS ${acceptingPlayer.userName} | ${game} | Room: ${roomId}`
       );
-
     }
   );
 
@@ -888,13 +892,17 @@ io.on("connection", (socket) => {
   socket.on(
     "reject_challenge",
     (data = {}) => {
+      const savedChallenge =
+        data.challengeId
+          ? pendingChallenges.get(
+              data.challengeId
+            )
+          : null;
 
       const challengerUserId =
-
         data.challengerUserId ||
-
+        savedChallenge?.challengerUserId ||
         data.fromUserId ||
-
         (
           data.challenger &&
           (
@@ -909,7 +917,6 @@ io.on("connection", (socket) => {
         );
 
       if (challenger) {
-
         io.to(
           challenger.socketId
         ).emit(
@@ -919,7 +926,12 @@ io.on("connection", (socket) => {
               "Opponent ne challenge decline kar diya."
           }
         );
+      }
 
+      if (data.challengeId) {
+        pendingChallenges.delete(
+          data.challengeId
+        );
       }
 
       socket.emit(
@@ -928,7 +940,6 @@ io.on("connection", (socket) => {
           success: true
         }
       );
-
     }
   );
 
@@ -939,7 +950,6 @@ io.on("connection", (socket) => {
   socket.on(
     "find_random_match",
     (data = {}) => {
-
       const registeredPlayer =
         onlinePlayers.get(
           socket.id
@@ -947,22 +957,16 @@ io.on("connection", (socket) => {
 
       const userId =
         normalizeId(
-
           data.userId ||
-
           (
             registeredPlayer &&
             registeredPlayer.userId
           )
-
         );
 
       const userName =
-
         data.userName ||
-
         data.name ||
-
         (
           registeredPlayer &&
           registeredPlayer.userName
@@ -987,7 +991,6 @@ io.on("connection", (socket) => {
         !userId ||
         !userName
       ) {
-
         socket.emit(
           "match_error",
           {
@@ -999,59 +1002,63 @@ io.on("connection", (socket) => {
         return;
       }
 
+      /*
+        Safety:
+        stale entry remove kar dete hain agar same
+        socket kisi purani queue state mein reh gaya ho.
+      */
+
+      waitingQueue =
+        waitingQueue.filter(
+          (player) => {
+            if (
+              player.socketId ===
+              socket.id
+            ) {
+              return false;
+            }
+
+            const oldSocket =
+              io.sockets.sockets.get(
+                player.socketId
+              );
+
+            return Boolean(oldSocket);
+          }
+        );
+
       console.log(
         `🔍 ${userName} | ${game} | ${betCoins} coins matchmaking queue mein aa gaya hai.`
       );
 
       // ----------------------------------------
-      // Already waiting?
-      // ----------------------------------------
-
-      const alreadyWaiting =
-        waitingQueue.some(
-          (player) =>
-            player.socketId ===
-            socket.id
-        );
-
-      if (
-        alreadyWaiting
-      ) {
-
-        socket.emit(
-          "waiting_for_opponent",
-          {
-
-            message:
-              "Aap already opponent ka wait kar rahe hain...",
-
-            game,
-
-            betCoins
-
-          }
-        );
-
-        return;
-      }
-
-      // ----------------------------------------
-      // Same GAME + Same BET opponent
+      // SAME GAME + SAME BET OPPONENT
       // ----------------------------------------
 
       const existingIndex =
         waitingQueue.findIndex(
           (player) =>
-
             player.socketId !==
               socket.id &&
 
-            player.betCoins ===
-              betCoins &&
+            normalizeId(
+              player.userId
+            ) !== userId &&
 
-            player.game ===
-              game
+            Number(
+              player.betCoins
+            ) === Number(
+              betCoins
+            ) &&
 
+            String(
+              player.game
+            ).toLowerCase() ===
+              game &&
+
+            io.sockets.sockets.has(
+              player.socketId
+            )
         );
 
       // ========================================
@@ -1061,7 +1068,6 @@ io.on("connection", (socket) => {
       if (
         existingIndex !== -1
       ) {
-
         const opponent =
           waitingQueue.splice(
             existingIndex,
@@ -1073,15 +1079,33 @@ io.on("connection", (socket) => {
             opponent.socketId
           );
 
-        if (
-          !opponentSocket
-        ) {
+        if (!opponentSocket) {
+          /*
+            Opponent stale nikla.
+            Current user ko queue mein daal do.
+          */
+
+          waitingQueue.push({
+            socketId:
+              socket.id,
+
+            userId,
+
+            userName,
+
+            game,
+
+            betCoins
+          });
 
           socket.emit(
-            "match_error",
+            "waiting_for_opponent",
             {
               message:
-                "Opponent disconnect ho gaya. Dobara try karein."
+                "Opponent disconnect ho gaya. Naya opponent search ho raha hai...",
+
+              game,
+              betCoins
             }
           );
 
@@ -1095,12 +1119,25 @@ io.on("connection", (socket) => {
             opponent.socketId
           );
 
+        /*
+          Both players join SAME ROOM.
+        */
+
         socket.join(
           roomId
         );
 
         opponentSocket.join(
           roomId
+        );
+
+        /*
+          Ensure current player queue mein
+          duplicate na rahe.
+        */
+
+        removeFromQueue(
+          socket.id
         );
 
         const currentProfile =
@@ -1114,7 +1151,6 @@ io.on("connection", (socket) => {
           );
 
         const matchData = {
-
           roomId,
 
           game,
@@ -1125,12 +1161,15 @@ io.on("connection", (socket) => {
             "random",
 
           player1: {
-
             id:
               userId,
 
+            userId,
+
             name:
               userName,
+
+            userName,
 
             socketId:
               socket.id,
@@ -1140,15 +1179,19 @@ io.on("connection", (socket) => {
                 currentProfile &&
                 currentProfile.profilePic
               ) || ""
-
           },
 
           player2: {
-
             id:
               opponent.userId,
 
+            userId:
+              opponent.userId,
+
             name:
+              opponent.userName,
+
+            userName:
               opponent.userName,
 
             socketId:
@@ -1159,10 +1202,13 @@ io.on("connection", (socket) => {
                 opponentProfile &&
                 opponentProfile.profilePic
               ) || ""
-
           }
-
         };
+
+        /*
+          MOST IMPORTANT:
+          SAME match_found event dono browsers ko.
+        */
 
         io.to(
           roomId
@@ -1175,49 +1221,41 @@ io.on("connection", (socket) => {
           `🎮 Match Start! ${game} | Room: ${roomId} | ${userName} VS ${opponent.userName} | Bet: ${betCoins}`
         );
 
+        return;
       }
 
       // ========================================
       // NO MATCH - WAIT
       // ========================================
 
-      else {
+      waitingQueue.push({
+        socketId:
+          socket.id,
 
-        waitingQueue.push({
+        userId,
 
-          socketId:
-            socket.id,
+        userName,
 
-          userId,
+        game,
 
-          userName,
+        betCoins
+      });
+
+      socket.emit(
+        "waiting_for_opponent",
+        {
+          message:
+            "Opponent ki talash ki ja rahi hai...",
 
           game,
 
           betCoins
+        }
+      );
 
-        });
-
-        socket.emit(
-          "waiting_for_opponent",
-          {
-
-            message:
-              "Opponent ki talash ki ja rahi hai...",
-
-            game,
-
-            betCoins
-
-          }
-        );
-
-        console.log(
-          `⏳ ${userName} ${game} ke liye queue mein wait kar raha hai.`
-        );
-
-      }
-
+      console.log(
+        `⏳ ${userName} ${game} ke liye queue mein wait kar raha hai.`
+      );
     }
   );
 
@@ -1228,7 +1266,6 @@ io.on("connection", (socket) => {
   socket.on(
     "cancel_queue",
     () => {
-
       removeFromQueue(
         socket.id
       );
@@ -1244,7 +1281,6 @@ io.on("connection", (socket) => {
       console.log(
         `🚫 Matchmaking cancelled: ${socket.id}`
       );
-
     }
   );
 
@@ -1252,28 +1288,9 @@ io.on("connection", (socket) => {
   // 9. GAME ROOM EVENTS
   // ====================================================
 
-  /*
-    Is event ko Ludo aur Pool ke
-    realtime moves bhejne ke liye
-    use kiya ja sakta hai.
-
-    Example:
-
-    socket.emit("game_event", {
-      roomId,
-      type: "DICE_ROLL",
-      payload: {
-        dice: 6
-      }
-    });
-
-    Doosre player ko event milega.
-  */
-
   socket.on(
     "game_event",
     (data = {}) => {
-
       const {
         roomId,
         type,
@@ -1284,19 +1301,19 @@ io.on("connection", (socket) => {
         !roomId ||
         !type
       ) {
-
         return;
-
       }
 
-      // Security:
-      // Player us room ka member hona chahiye
+      /*
+        Security:
+        sender us room ka member hona chahiye.
+      */
+
       if (
         !socket.rooms.has(
           roomId
         )
       ) {
-
         socket.emit(
           "realtime_error",
           {
@@ -1308,13 +1325,16 @@ io.on("connection", (socket) => {
         return;
       }
 
-      // Sender ke ilawa opponent ko event bhejo
+      /*
+        Sender ke ilawa room ke opponent
+        ko game action bhejo.
+      */
+
       socket
         .to(roomId)
         .emit(
           "game_event",
           {
-
             roomId,
 
             type,
@@ -1323,10 +1343,8 @@ io.on("connection", (socket) => {
 
             fromSocketId:
               socket.id
-
           }
         );
-
     }
   );
 
@@ -1337,7 +1355,6 @@ io.on("connection", (socket) => {
   socket.on(
     "leave_game_room",
     (data = {}) => {
-
       const roomId =
         data.roomId;
 
@@ -1347,9 +1364,7 @@ io.on("connection", (socket) => {
           roomId
         )
       ) {
-
         return;
-
       }
 
       socket
@@ -1357,20 +1372,17 @@ io.on("connection", (socket) => {
         .emit(
           "opponent_left_game",
           {
-
             socketId:
               socket.id,
 
             message:
               "Opponent game se nikal gaya."
-
           }
         );
 
       socket.leave(
         roomId
       );
-
     }
   );
 
@@ -1381,7 +1393,6 @@ io.on("connection", (socket) => {
   socket.on(
     "disconnect",
     () => {
-
       console.log(
         "❌ User disconnect ho gaya:",
         socket.id
@@ -1406,23 +1417,47 @@ io.on("connection", (socket) => {
         socket.id
       );
 
-      // Dusre clients ko offline information
+      /*
+        Is disconnected player ke pending
+        challenges bhi clean kar do.
+      */
+
+      for (
+        const [
+          challengeId,
+          challenge
+        ] of pendingChallenges
+      ) {
+        if (
+          normalizeId(
+            challenge.challengerUserId
+          ) === normalizeId(
+            userId
+          ) ||
+          normalizeId(
+            challenge.targetUserId
+          ) === normalizeId(
+            userId
+          )
+        ) {
+          pendingChallenges.delete(
+            challengeId
+          );
+        }
+      }
+
       socket.broadcast.emit(
         "player_offline",
         {
-
           userId:
             userId || null,
 
           socketId:
             socket.id
-
         }
       );
-
     }
   );
-
 });
 
 // ======================================================
@@ -1433,10 +1468,8 @@ server.listen(
   PORT,
   "0.0.0.0",
   () => {
-
     console.log(
       `🚀 Server is running smoothly on port ${PORT}`
     );
-
   }
 );
