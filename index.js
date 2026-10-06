@@ -66,19 +66,19 @@ const io = new Server(server, {
 
 
 
-  cors: {
+  cors: {
 
 
 
-    origin: "*",
+    origin: "*",
 
 
 
-    methods: ["GET", "POST"]
+    methods: ["GET", "POST"]
 
 
 
-  }
+  }
 
 
 
@@ -166,35 +166,35 @@ mongoose
 
 
 
-  .connect(MONGO_URI)
+  .connect(MONGO_URI)
 
 
 
-  .then(() => {
+  .then(() => {
 
 
 
-    console.log("✅ Successfully connected to MongoDB Atlas");
+    console.log("✅ Successfully connected to MongoDB Atlas");
 
 
 
-  })
+  })
 
 
 
-  .catch((err) => {
+  .catch((err) => {
 
 
 
-    console.error("❌ MongoDB Connection Error:", err.message);
+    console.error("❌ MongoDB Connection Error:", err.message);
 
 
 
-    process.exit(1);
+    process.exit(1);
 
 
 
-  });
+  });
 
 
 
@@ -222,43 +222,19 @@ const userSchema = new mongoose.Schema({
 
 
 
-  name: {
+  name: {
 
 
 
-    type: String,
+    type: String,
 
 
 
-    required: true
+    required: true
 
 
 
-  },
-
-
-
-
-
-
-
-  phone: {
-
-
-
-    type: String,
-
-
-
-    required: true,
-
-
-
-    unique: true
-
-
-
-  },
+  },
 
 
 
@@ -266,19 +242,23 @@ const userSchema = new mongoose.Schema({
 
 
 
-  password: {
+  phone: {
 
 
 
-    type: String,
+    type: String,
 
 
 
-    required: true
+    required: true,
 
 
 
-  },
+    unique: true
+
+
+
+  },
 
 
 
@@ -286,19 +266,39 @@ const userSchema = new mongoose.Schema({
 
 
 
-  coins: {
+  password: {
 
 
 
-    type: Number,
+    type: String,
 
 
 
-    default: 0
+    required: true
 
 
 
-  }
+  },
+
+
+
+
+
+
+
+  coins: {
+
+
+
+    type: Number,
+
+
+
+    default: 0
+
+
+
+  }
 
 
 
@@ -430,40 +430,326 @@ const Deposit =
   mongoose.model("Deposit", depositSchema);
 
 // ------------------------------------------------------
-// ADMIN SECURITY
+// ADMIN SECURITY - PRIVATE BACKEND TOKEN SYSTEM
 // ------------------------------------------------------
-// Railway Variables mein ADMIN_DEPOSIT_KEY set karo.
-// Admin approve/reject request mein:
-// x-admin-key: YOUR_SECRET_KEY
+// Railway Variables:
+// ADMIN_PHONE=registered SAMATKAAR admin phone
+// ADMIN_DEPOSIT_KEY=long private signing secret
+//
+// Secret key stays only on Railway/backend.
+// Browser receives only a short-lived signed admin token.
 // ------------------------------------------------------
 
-function requireDepositAdmin(req, res, next) {
-  const configuredKey = String(process.env.ADMIN_DEPOSIT_KEY || "");
-  const suppliedKey = String(req.headers["x-admin-key"] || "");
+const ADMIN_TOKEN_TTL_MS = 8 * 60 * 60 * 1000;
+const ADMIN_LOGIN_WINDOW_MS = 15 * 60 * 1000;
+const ADMIN_LOGIN_MAX_FAILURES = 5;
+const adminLoginAttempts = new Map();
 
-  if (!configuredKey) {
-    return res.status(503).json({
-      success: false,
-      error: "ADMIN_DEPOSIT_KEY server par configure nahi hai."
-    });
+function normalizeAdminPhone(value) {
+  let phone = String(value || "").replace(/\D/g, "");
+
+  if (phone.startsWith("0092")) {
+    phone = phone.slice(2);
   }
 
-  const configuredBuffer = Buffer.from(configuredKey);
-  const suppliedBuffer = Buffer.from(suppliedKey);
-
-  const valid =
-    configuredBuffer.length === suppliedBuffer.length &&
-    crypto.timingSafeEqual(configuredBuffer, suppliedBuffer);
-
-  if (!valid) {
-    return res.status(401).json({
-      success: false,
-      error: "Unauthorized admin request."
-    });
+  if (phone.startsWith("92") && phone.length === 12) {
+    phone = `0${phone.slice(2)}`;
   }
 
-  next();
+  return phone;
 }
+
+function isAdminPhone(phone) {
+  const configuredAdminPhone = normalizeAdminPhone(
+    process.env.ADMIN_PHONE
+  );
+
+  if (!configuredAdminPhone) {
+    return false;
+  }
+
+  return normalizeAdminPhone(phone) === configuredAdminPhone;
+}
+
+function getAdminSigningSecret() {
+  return String(process.env.ADMIN_DEPOSIT_KEY || "");
+}
+
+function createAdminToken(user) {
+  const secret = getAdminSigningSecret();
+
+  if (!secret) {
+    throw new Error(
+      "ADMIN_DEPOSIT_KEY server par configure nahi hai."
+    );
+  }
+
+  const payload = {
+    sub: String(user._id),
+    phone: normalizeAdminPhone(user.phone),
+    role: "admin",
+    exp: Date.now() + ADMIN_TOKEN_TTL_MS
+  };
+
+  const encodedPayload = Buffer.from(
+    JSON.stringify(payload)
+  ).toString("base64url");
+
+  const signature = crypto
+    .createHmac("sha256", secret)
+    .update(encodedPayload)
+    .digest("base64url");
+
+  return `${encodedPayload}.${signature}`;
+}
+
+function verifyAdminToken(token) {
+  const secret = getAdminSigningSecret();
+
+  if (!secret || !token) {
+    return null;
+  }
+
+  const parts = String(token).split(".");
+
+  if (parts.length !== 2) {
+    return null;
+  }
+
+  const [encodedPayload, suppliedSignature] = parts;
+
+  const expectedSignature = crypto
+    .createHmac("sha256", secret)
+    .update(encodedPayload)
+    .digest("base64url");
+
+  const expectedBuffer = Buffer.from(expectedSignature);
+  const suppliedBuffer = Buffer.from(suppliedSignature);
+
+  if (
+    expectedBuffer.length !== suppliedBuffer.length ||
+    !crypto.timingSafeEqual(expectedBuffer, suppliedBuffer)
+  ) {
+    return null;
+  }
+
+  try {
+    const payload = JSON.parse(
+      Buffer.from(encodedPayload, "base64url").toString("utf8")
+    );
+
+    if (
+      !payload ||
+      payload.role !== "admin" ||
+      !payload.sub ||
+      !payload.exp ||
+      Number(payload.exp) <= Date.now() ||
+      !isAdminPhone(payload.phone)
+    ) {
+      return null;
+    }
+
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
+function getAdminAttemptKey(req) {
+  return String(
+    req.headers["x-forwarded-for"] ||
+      req.ip ||
+      req.socket?.remoteAddress ||
+      "unknown"
+  )
+    .split(",")[0]
+    .trim();
+}
+
+function adminLoginBlocked(key) {
+  const entry = adminLoginAttempts.get(key);
+
+  if (!entry) {
+    return false;
+  }
+
+  if (Date.now() - entry.firstFailureAt > ADMIN_LOGIN_WINDOW_MS) {
+    adminLoginAttempts.delete(key);
+    return false;
+  }
+
+  return entry.failures >= ADMIN_LOGIN_MAX_FAILURES;
+}
+
+function recordAdminLoginFailure(key) {
+  const now = Date.now();
+  const existing = adminLoginAttempts.get(key);
+
+  if (
+    !existing ||
+    now - existing.firstFailureAt > ADMIN_LOGIN_WINDOW_MS
+  ) {
+    adminLoginAttempts.set(key, {
+      failures: 1,
+      firstFailureAt: now
+    });
+    return;
+  }
+
+  existing.failures += 1;
+  adminLoginAttempts.set(key, existing);
+}
+
+async function requireDepositAdmin(req, res, next) {
+  try {
+    const authorization = String(
+      req.headers.authorization || ""
+    );
+
+    const token = authorization.startsWith("Bearer ")
+      ? authorization.slice(7).trim()
+      : "";
+
+    const payload = verifyAdminToken(token);
+
+    if (!payload) {
+      return res.status(401).json({
+        success: false,
+        error: "Admin session invalid ya expire ho chuki hai."
+      });
+    }
+
+    if (!mongoose.Types.ObjectId.isValid(payload.sub)) {
+      return res.status(401).json({
+        success: false,
+        error: "Invalid admin session."
+      });
+    }
+
+    const adminUser = await User.findById(payload.sub)
+      .select("_id name phone coins")
+      .lean();
+
+    if (!adminUser || !isAdminPhone(adminUser.phone)) {
+      return res.status(403).json({
+        success: false,
+        error: "Is account ko admin access nahi hai."
+      });
+    }
+
+    req.adminUser = adminUser;
+    next();
+  } catch (err) {
+    console.error("Admin authorization error:", err);
+
+    return res.status(500).json({
+      success: false,
+      error: "Admin authorization check fail ho gaya."
+    });
+  }
+}
+
+// ======================================================
+// ADMIN LOGIN - SHORT-LIVED SIGNED TOKEN
+// ======================================================
+
+app.post("/api/admin/auth/login", async (req, res) => {
+  try {
+    if (!process.env.ADMIN_PHONE) {
+      return res.status(503).json({
+        success: false,
+        error: "ADMIN_PHONE server par configure nahi hai."
+      });
+    }
+
+    if (!process.env.ADMIN_DEPOSIT_KEY) {
+      return res.status(503).json({
+        success: false,
+        error: "ADMIN_DEPOSIT_KEY server par configure nahi hai."
+      });
+    }
+
+    const attemptKey = getAdminAttemptKey(req);
+
+    if (adminLoginBlocked(attemptKey)) {
+      return res.status(429).json({
+        success: false,
+        error:
+          "Bohat zyada failed admin login attempts. 15 minutes baad dobara try karein."
+      });
+    }
+
+    const phone = String(req.body.phone || "").trim();
+    const password = String(req.body.password || "");
+
+    if (!phone || !password) {
+      return res.status(400).json({
+        success: false,
+        error: "Admin phone aur password required hain."
+      });
+    }
+
+    if (!isAdminPhone(phone)) {
+      recordAdminLoginFailure(attemptKey);
+
+      return res.status(403).json({
+        success: false,
+        error: "Is phone number ko admin access nahi hai."
+      });
+    }
+
+    const normalizedInputPhone = normalizeAdminPhone(phone);
+
+    const user = await User.findOne({
+      $or: [
+        { phone },
+        { phone: normalizedInputPhone }
+      ]
+    });
+
+    if (!user || !isAdminPhone(user.phone)) {
+      recordAdminLoginFailure(attemptKey);
+
+      return res.status(403).json({
+        success: false,
+        error: "Admin account database mein nahi mila."
+      });
+    }
+
+    if (user.password !== password) {
+      recordAdminLoginFailure(attemptKey);
+
+      return res.status(401).json({
+        success: false,
+        error: "Admin password ghalat hai."
+      });
+    }
+
+    adminLoginAttempts.delete(attemptKey);
+
+    const token = createAdminToken(user);
+
+    return res.status(200).json({
+      success: true,
+      message: "Admin login successful.",
+      token,
+      expiresInMs: ADMIN_TOKEN_TTL_MS,
+      admin: {
+        id: user._id,
+        name: user.name,
+        phone: user.phone,
+        role: "admin"
+      }
+    });
+  } catch (err) {
+    console.error("Admin login error:", err);
+
+    return res.status(500).json({
+      success: false,
+      error: "Admin login nahi ho saka."
+    });
+  }
+});
 
 // ======================================================
 // STEP 2 - CREATE PENDING DEPOSIT
@@ -861,31 +1147,31 @@ const luckyTicketSchema = new mongoose.Schema(
 
 
 
-  {
+  {
 
 
 
-    publicCode: {
+    publicCode: {
 
 
 
-      type: String,
+      type: String,
 
 
 
-      required: true,
+      required: true,
 
 
 
-      unique: true,
+      unique: true,
 
 
 
-      index: true
+      index: true
 
 
 
-    },
+    },
 
 
 
@@ -893,23 +1179,23 @@ const luckyTicketSchema = new mongoose.Schema(
 
 
 
-    secretCode: {
+    secretCode: {
 
 
 
-      type: String,
+      type: String,
 
 
 
-      required: true,
+      required: true,
 
 
 
-      unique: true
+      unique: true
 
 
 
-    },
+    },
 
 
 
@@ -917,23 +1203,23 @@ const luckyTicketSchema = new mongoose.Schema(
 
 
 
-    userId: {
+    userId: {
 
 
 
-      type: String,
+      type: String,
 
 
 
-      required: true,
+      required: true,
 
 
 
-      index: true
+      index: true
 
 
 
-    },
+    },
 
 
 
@@ -941,19 +1227,19 @@ const luckyTicketSchema = new mongoose.Schema(
 
 
 
-    userName: {
+    userName: {
 
 
 
-      type: String,
+      type: String,
 
 
 
-      required: true
+      required: true
 
 
 
-    },
+    },
 
 
 
@@ -961,19 +1247,19 @@ const luckyTicketSchema = new mongoose.Schema(
 
 
 
-    phone: {
+    phone: {
 
 
 
-      type: String,
+      type: String,
 
 
 
-      required: true
+      required: true
 
 
 
-    },
+    },
 
 
 
@@ -981,23 +1267,23 @@ const luckyTicketSchema = new mongoose.Schema(
 
 
 
-    roundId: {
+    roundId: {
 
 
 
-      type: String,
+      type: String,
 
 
 
-      required: true,
+      required: true,
 
 
 
-      index: true
+      index: true
 
 
 
-    },
+    },
 
 
 
@@ -1005,23 +1291,23 @@ const luckyTicketSchema = new mongoose.Schema(
 
 
 
-    paymentMethod: {
+    paymentMethod: {
 
 
 
-      type: String,
+      type: String,
 
 
 
-      enum: ["coins"],
+      enum: ["coins"],
 
 
 
-      required: true
+      required: true
 
 
 
-    },
+    },
 
 
 
@@ -1029,47 +1315,47 @@ const luckyTicketSchema = new mongoose.Schema(
 
 
 
-    status: {
+    status: {
 
 
 
-      type: String,
+      type: String,
 
 
 
-      enum: [
+      enum: [
 
 
 
-        "active",
+        "active",
 
 
 
-        "expired",
+        "expired",
 
 
 
-        "winner",
+        "winner",
 
 
 
-        "cancelled"
+        "cancelled"
 
 
 
-      ],
+      ],
 
 
 
-      default: "active",
+      default: "active",
 
 
 
-      index: true
+      index: true
 
 
 
-    },
+    },
 
 
 
@@ -1077,19 +1363,19 @@ const luckyTicketSchema = new mongoose.Schema(
 
 
 
-    issuedAt: {
+    issuedAt: {
 
 
 
-      type: Date,
+      type: Date,
 
 
 
-      default: Date.now
+      default: Date.now
 
 
 
-    },
+    },
 
 
 
@@ -1097,35 +1383,35 @@ const luckyTicketSchema = new mongoose.Schema(
 
 
 
-    expiresAt: {
+    expiresAt: {
 
 
 
-      type: Date,
+      type: Date,
 
 
 
-      required: true
+      required: true
 
 
 
-    }
+    }
 
 
 
-  },
+  },
 
 
 
-  {
+  {
 
 
 
-    timestamps: true
+    timestamps: true
 
 
 
-  }
+  }
 
 
 
@@ -1141,23 +1427,23 @@ const LuckyTicket =
 
 
 
-  mongoose.models.LuckyTicket ||
+  mongoose.models.LuckyTicket ||
 
 
 
-  mongoose.model(
+  mongoose.model(
 
 
 
-    "LuckyTicket",
+    "LuckyTicket",
 
 
 
-    luckyTicketSchema
+    luckyTicketSchema
 
 
 
-  );
+  );
 
 
 
@@ -1165,7 +1451,7 @@ const LuckyTicket =
 
 
 
-    // ======================================================
+    // ======================================================
 
 
 
@@ -1185,31 +1471,31 @@ const luckyRoundSchema = new mongoose.Schema(
 
 
 
-  {
+  {
 
 
 
-    roundId: {
+    roundId: {
 
 
 
-      type: String,
+      type: String,
 
 
 
-      required: true,
+      required: true,
 
 
 
-      unique: true,
+      unique: true,
 
 
 
-      index: true
+      index: true
 
 
 
-    },
+    },
 
 
 
@@ -1217,27 +1503,27 @@ const luckyRoundSchema = new mongoose.Schema(
 
 
 
-    status: {
+    status: {
 
 
 
-      type: String,
+      type: String,
 
 
 
-      enum: ["active", "drawing", "completed"],
+      enum: ["active", "drawing", "completed"],
 
 
 
-      default: "active",
+      default: "active",
 
 
 
-      index: true
+      index: true
 
 
 
-    },
+    },
 
 
 
@@ -1245,19 +1531,19 @@ const luckyRoundSchema = new mongoose.Schema(
 
 
 
-    startsAt: {
+    startsAt: {
 
 
 
-      type: Date,
+      type: Date,
 
 
 
-      required: true
+      required: true
 
 
 
-    },
+    },
 
 
 
@@ -1265,19 +1551,19 @@ const luckyRoundSchema = new mongoose.Schema(
 
 
 
-    endsAt: {
+    endsAt: {
 
 
 
-      type: Date,
+      type: Date,
 
 
 
-      required: true
+      required: true
 
 
 
-    },
+    },
 
 
 
@@ -1285,23 +1571,23 @@ const luckyRoundSchema = new mongoose.Schema(
 
 
 
-    winnerTicketId: {
+    winnerTicketId: {
 
 
 
-      type: mongoose.Schema.Types.ObjectId,
+      type: mongoose.Schema.Types.ObjectId,
 
 
 
-      ref: "LuckyTicket",
+      ref: "LuckyTicket",
 
 
 
-      default: null
+      default: null
 
 
 
-    },
+    },
 
 
 
@@ -1309,19 +1595,19 @@ const luckyRoundSchema = new mongoose.Schema(
 
 
 
-    winnerPublicCode: {
+    winnerPublicCode: {
 
 
 
-      type: String,
+      type: String,
 
 
 
-      default: null
+      default: null
 
 
 
-    },
+    },
 
 
 
@@ -1329,19 +1615,19 @@ const luckyRoundSchema = new mongoose.Schema(
 
 
 
-    winnerUserId: {
+    winnerUserId: {
 
 
 
-      type: String,
+      type: String,
 
 
 
-      default: null
+      default: null
 
 
 
-    },
+    },
 
 
 
@@ -1349,35 +1635,35 @@ const luckyRoundSchema = new mongoose.Schema(
 
 
 
-    completedAt: {
+    completedAt: {
 
 
 
-      type: Date,
+      type: Date,
 
 
 
-      default: null
+      default: null
 
 
 
-    }
+    }
 
 
 
-  },
+  },
 
 
 
-  {
+  {
 
 
 
-    timestamps: true
+    timestamps: true
 
 
 
-  }
+  }
 
 
 
@@ -1393,23 +1679,23 @@ const LuckyRound =
 
 
 
-  mongoose.models.LuckyRound ||
+  mongoose.models.LuckyRound ||
 
 
 
-  mongoose.model(
+  mongoose.model(
 
 
 
-    "LuckyRound",
+    "LuckyRound",
 
 
 
-    luckyRoundSchema
+    luckyRoundSchema
 
 
 
-  );
+  );
 
 
 
@@ -1417,7 +1703,7 @@ const LuckyRound =
 
 
 
-  // ======================================================
+  // ======================================================
 
 
 
@@ -1469,7 +1755,7 @@ async function createNewLuckyRound() {
 
 
 
-  const startsAt = new Date();
+  const startsAt = new Date();
 
 
 
@@ -1477,35 +1763,35 @@ async function createNewLuckyRound() {
 
 
 
-  const endsAt = new Date(
+  const endsAt = new Date(
 
 
 
-    startsAt.getTime() +
+    startsAt.getTime() +
 
 
 
-    LUCKY_DRAW_ROUND_DAYS *
+    LUCKY_DRAW_ROUND_DAYS *
 
 
 
-    24 *
+    24 *
 
 
 
-    60 *
+    60 *
 
 
 
-    60 *
+    60 *
 
 
 
-    1000
+    1000
 
 
 
-  );
+  );
 
 
 
@@ -1513,11 +1799,11 @@ async function createNewLuckyRound() {
 
 
 
-  const roundId =
+  const roundId =
 
 
 
-    `ROUND-${Date.now()}`;
+    `ROUND-${Date.now()}`;
 
 
 
@@ -1525,27 +1811,27 @@ async function createNewLuckyRound() {
 
 
 
-  const round = await LuckyRound.create({
+  const round = await LuckyRound.create({
 
 
 
-    roundId,
+    roundId,
 
 
 
-    status: "active",
+    status: "active",
 
 
 
-    startsAt,
+    startsAt,
 
 
 
-    endsAt
+    endsAt
 
 
 
-  });
+  });
 
 
 
@@ -1553,15 +1839,15 @@ async function createNewLuckyRound() {
 
 
 
-  console.log(
+  console.log(
 
 
 
-    `🎟️ New Lucky Draw round created: ${round.roundId}`
+    `🎟️ New Lucky Draw round created: ${round.roundId}`
 
 
 
-  );
+  );
 
 
 
@@ -1569,7 +1855,7 @@ async function createNewLuckyRound() {
 
 
 
-  return round;
+  return round;
 
 
 
@@ -1587,269 +1873,269 @@ async function createNewLuckyRound() {
 
 async function closeLuckyRound(round) {
 
-  if (!round) {
+  if (!round) {
 
-    throw new Error("Lucky Draw round missing hai.");
+    throw new Error("Lucky Draw round missing hai.");
 
-  }
-
-
-
-  // Agar pehle hi complete hai to dobara draw mat karo.
-
-  if (round.status === "completed") {
-
-    return round;
-
-  }
+  }
 
 
 
-  const now = new Date();
+  // Agar pehle hi complete hai to dobara draw mat karo.
+
+  if (round.status === "completed") {
+
+    return round;
+
+  }
 
 
 
-  // ------------------------------------------
-
-  // ROUND LOCK KARO
-
-  // ------------------------------------------
+  const now = new Date();
 
 
 
- const lockedRound = await LuckyRound.findOneAndUpdate(
+  // ------------------------------------------
 
-  {
+  // ROUND LOCK KARO
 
-    _id: round._id,
+  // ------------------------------------------
 
-    status: {
 
-      $in: ["active", "drawing"]
 
-    }
+ const lockedRound = await LuckyRound.findOneAndUpdate(
 
-  },
+  {
 
-  {
+    _id: round._id,
 
-    $set: {
+    status: {
 
-      status: "drawing"
+      $in: ["active", "drawing"]
 
-    }
+    }
 
-  },
+  },
 
-  {
+  {
 
-    new: true
+    $set: {
 
-  }
+      status: "drawing"
+
+    }
+
+  },
+
+  {
+
+    new: true
+
+  }
 
 );
 
 
 
-  // Agar kisi doosri request ne already lock kar diya
+  // Agar kisi doosri request ne already lock kar diya
 
-  // to latest round return karo.
+  // to latest round return karo.
 
-  if (!lockedRound) {
+  if (!lockedRound) {
 
-    return await LuckyRound.findById(round._id);
+    return await LuckyRound.findById(round._id);
 
-  }
+  }
 
 
 
-  // ------------------------------------------
+  // ------------------------------------------
 
-  // CURRENT ROUND KE ACTIVE TICKETS
+  // CURRENT ROUND KE ACTIVE TICKETS
 
-  // ------------------------------------------
+  // ------------------------------------------
 
 
 
-  const activeTickets = await LuckyTicket.find({
+  const activeTickets = await LuckyTicket.find({
 
-    roundId: lockedRound.roundId,
+    roundId: lockedRound.roundId,
 
-    status: "active",
+    status: "active",
 
-    expiresAt: {
+    expiresAt: {
 
-      $lte: now
+      $lte: now
 
-    }
+    }
 
-  });
+  });
 
 
 
-  // ------------------------------------------
+  // ------------------------------------------
 
-  // AGAR KOI TICKET NAHI
+  // AGAR KOI TICKET NAHI
 
-  // ------------------------------------------
+  // ------------------------------------------
 
 
 
-  if (activeTickets.length === 0) {
+  if (activeTickets.length === 0) {
 
-    lockedRound.status = "completed";
+    lockedRound.status = "completed";
 
-    lockedRound.completedAt = now;
+    lockedRound.completedAt = now;
 
 
 
-    await lockedRound.save();
+    await lockedRound.save();
 
 
 
-    console.log(
+    console.log(
 
-      `🎟️ ${lockedRound.roundId} completed - no tickets sold.`
+      `🎟️ ${lockedRound.roundId} completed - no tickets sold.`
 
-    );
+    );
 
 
 
-    return lockedRound;
+    return lockedRound;
 
-  }
+  }
 
 
 
-  // ------------------------------------------
+  // ------------------------------------------
 
-  // CRYPTOGRAPHICALLY RANDOM WINNER
+  // CRYPTOGRAPHICALLY RANDOM WINNER
 
-  // ------------------------------------------
+  // ------------------------------------------
 
 
 
-  const winnerIndex = crypto.randomInt(
+  const winnerIndex = crypto.randomInt(
 
-    0,
+    0,
 
-    activeTickets.length
+    activeTickets.length
 
-  );
+  );
 
 
 
-  const winnerTicket =
+  const winnerTicket =
 
-    activeTickets[winnerIndex];
+    activeTickets[winnerIndex];
 
 
 
-  // ------------------------------------------
+  // ------------------------------------------
 
-  // WINNER TICKET
+  // WINNER TICKET
 
-  // ------------------------------------------
+  // ------------------------------------------
 
 
 
-  winnerTicket.status = "winner";
+  winnerTicket.status = "winner";
 
 
 
-  await winnerTicket.save();
+  await winnerTicket.save();
 
 
 
-  // ------------------------------------------
+  // ------------------------------------------
 
-  // BAAQI TICKETS EXPIRE
+  // BAAQI TICKETS EXPIRE
 
-  // ------------------------------------------
+  // ------------------------------------------
 
 
 
-  await LuckyTicket.updateMany(
+  await LuckyTicket.updateMany(
 
-    {
+    {
 
-      roundId: lockedRound.roundId,
+      roundId: lockedRound.roundId,
 
 
 
-      _id: {
+      _id: {
 
-        $ne: winnerTicket._id
+        $ne: winnerTicket._id
 
-      },
+      },
 
 
 
-      status: "active"
+      status: "active"
 
-    },
+    },
 
-    {
+    {
 
-      $set: {
+      $set: {
 
-        status: "expired"
+        status: "expired"
 
-      }
+      }
 
-    }
+    }
 
-  );
+  );
 
 
 
-  // ------------------------------------------
+  // ------------------------------------------
 
-  // WINNER ROUND ME PERMANENTLY SAVE
+  // WINNER ROUND ME PERMANENTLY SAVE
 
-  // ------------------------------------------
+  // ------------------------------------------
 
 
 
-  lockedRound.status = "completed";
+  lockedRound.status = "completed";
 
 
 
-  lockedRound.winnerTicketId =
+  lockedRound.winnerTicketId =
 
-    winnerTicket._id;
+    winnerTicket._id;
 
 
 
-  lockedRound.winnerPublicCode =
+  lockedRound.winnerPublicCode =
 
-    winnerTicket.publicCode;
+    winnerTicket.publicCode;
 
 
 
-  lockedRound.winnerUserId =
+  lockedRound.winnerUserId =
 
-    winnerTicket.userId;
+    winnerTicket.userId;
 
 
 
-  lockedRound.completedAt = now;
+  lockedRound.completedAt = now;
 
 
 
-  await lockedRound.save();
+  await lockedRound.save();
 
 
 
-  console.log(
+  console.log(
 
-    `🏆 Lucky Draw Winner: ${winnerTicket.publicCode} | Round: ${lockedRound.roundId}`
+    `🏆 Lucky Draw Winner: ${winnerTicket.publicCode} | Round: ${lockedRound.roundId}`
 
-  );
+  );
 
 
 
-  return lockedRound;
+  return lockedRound;
 
 }
 
@@ -1885,131 +2171,131 @@ async function closeLuckyRound(round) {
 
 async function getCurrentLuckyRound() {
 
-  const now = new Date();
+  const now = new Date();
 
 
 
-  // ------------------------------------------
+  // ------------------------------------------
 
-  // PEHLE EXPIRED ACTIVE ROUND CHECK KARO
+  // PEHLE EXPIRED ACTIVE ROUND CHECK KARO
 
-  // ------------------------------------------
+  // ------------------------------------------
 
 
 
-  const expiredRound =
+  const expiredRound =
 
-    await LuckyRound.findOne({
+    await LuckyRound.findOne({
 
-      status: "active",
+      status: "active",
 
 
 
-      endsAt: {
+      endsAt: {
 
-        $lte: now
+        $lte: now
 
-      }
+      }
 
-    }).sort({
+    }).sort({
 
-      startsAt: 1
+      startsAt: 1
 
-    });
+    });
 
 
 
-  // Round time khatam ho gaya:
+  // Round time khatam ho gaya:
 
-  // pehle winner select hoga.
+  // pehle winner select hoga.
 
-  if (expiredRound) {
+  if (expiredRound) {
 
-    await closeLuckyRound(expiredRound);
+    await closeLuckyRound(expiredRound);
 
-  }
+  }
 
 
 
-  // ------------------------------------------
+  // ------------------------------------------
 
-  // AGAR DRAWING ROUND HAI
+  // AGAR DRAWING ROUND HAI
 
-  // ------------------------------------------
+  // ------------------------------------------
 
 
 
-  const drawingRound =
+  const drawingRound =
 
-    await LuckyRound.findOne({
+    await LuckyRound.findOne({
 
-      status: "drawing"
+      status: "drawing"
 
-    });
+    });
 
 
 
-  if (drawingRound) {
+  if (drawingRound) {
 
-    await closeLuckyRound(drawingRound);
+    await closeLuckyRound(drawingRound);
 
-  }
+  }
 
 
 
-  // ------------------------------------------
+  // ------------------------------------------
 
-  // CURRENT VALID ACTIVE ROUND
+  // CURRENT VALID ACTIVE ROUND
 
-  // ------------------------------------------
+  // ------------------------------------------
 
 
 
-  let currentRound =
+  let currentRound =
 
-    await LuckyRound.findOne({
+    await LuckyRound.findOne({
 
-      status: "active",
+      status: "active",
 
 
 
-      endsAt: {
+      endsAt: {
 
-        $gt: now
+        $gt: now
 
-      }
+      }
 
-    }).sort({
+    }).sort({
 
-      startsAt: -1
+      startsAt: -1
 
-    });
+    });
 
 
 
-  if (currentRound) {
+  if (currentRound) {
 
-    return currentRound;
+    return currentRound;
 
-  }
+  }
 
 
 
-  // ------------------------------------------
+  // ------------------------------------------
 
-  // KOI ACTIVE ROUND NAHI = NEW ROUND
+  // KOI ACTIVE ROUND NAHI = NEW ROUND
 
-  // ------------------------------------------
+  // ------------------------------------------
 
 
 
-  currentRound =
+  currentRound =
 
-    await createNewLuckyRound();
+    await createNewLuckyRound();
 
 
 
-  return currentRound;
+  return currentRound;
 
 }
 
@@ -2035,27 +2321,19 @@ function randomTicketPart(length) {
 
 
 
-  // I and O intentionally remove kiye hain
+  // I and O intentionally remove kiye hain
 
 
 
-  // taake 1/I aur 0/O ka confusion na ho.
+  // taake 1/I aur 0/O ka confusion na ho.
 
 
 
-  const chars =
+  const chars =
 
 
 
-    "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-
-
-
-
-
-
-
-  let result = "";
+    "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
 
 
@@ -2063,15 +2341,7 @@ function randomTicketPart(length) {
 
 
 
-  for (let i = 0; i < length; i += 1) {
-
-
-
-    const randomIndex =
-
-
-
-      crypto.randomInt(0, chars.length);
+  let result = "";
 
 
 
@@ -2079,11 +2349,15 @@ function randomTicketPart(length) {
 
 
 
-    result += chars[randomIndex];
+  for (let i = 0; i < length; i += 1) {
 
 
 
-  }
+    const randomIndex =
+
+
+
+      crypto.randomInt(0, chars.length);
 
 
 
@@ -2091,7 +2365,19 @@ function randomTicketPart(length) {
 
 
 
-  return result;
+    result += chars[randomIndex];
+
+
+
+  }
+
+
+
+
+
+
+
+  return result;
 
 
 
@@ -2123,15 +2409,15 @@ async function generateSecureTicket() {
 
 
 
-  while (true) {
+  while (true) {
 
 
 
-    // USER KO YE DIKHEGA:
+    // USER KO YE DIKHEGA:
 
 
 
-    // SK-8F4K4KO2
+    // SK-8F4K4KO2
 
 
 
@@ -2139,11 +2425,11 @@ async function generateSecureTicket() {
 
 
 
-    const publicCode =
+    const publicCode =
 
 
 
-      `SK-${randomTicketPart(8)}`;
+      `SK-${randomTicketPart(8)}`;
 
 
 
@@ -2151,11 +2437,11 @@ async function generateSecureTicket() {
 
 
 
-    // USER KO YE PART NAHI DIYA JAYEGA:
+    // USER KO YE PART NAHI DIYA JAYEGA:
 
 
 
-    // 92QX
+    // 92QX
 
 
 
@@ -2163,11 +2449,11 @@ async function generateSecureTicket() {
 
 
 
-    const secretPart =
+    const secretPart =
 
 
 
-      randomTicketPart(4);
+      randomTicketPart(4);
 
 
 
@@ -2175,11 +2461,11 @@ async function generateSecureTicket() {
 
 
 
-    // DATABASE MEIN COMPLETE CODE:
+    // DATABASE MEIN COMPLETE CODE:
 
 
 
-    // SK-8F4K4KO2-92QX
+    // SK-8F4K4KO2-92QX
 
 
 
@@ -2187,11 +2473,11 @@ async function generateSecureTicket() {
 
 
 
-    const secretCode =
+    const secretCode =
 
 
 
-      `${publicCode}-${secretPart}`;
+      `${publicCode}-${secretPart}`;
 
 
 
@@ -2199,11 +2485,11 @@ async function generateSecureTicket() {
 
 
 
-    // Check karo ke same ticket pehle se
+    // Check karo ke same ticket pehle se
 
 
 
-    // database mein exist na karta ho.
+    // database mein exist na karta ho.
 
 
 
@@ -2211,47 +2497,47 @@ async function generateSecureTicket() {
 
 
 
-    const exists =
+    const exists =
 
 
 
-      await LuckyTicket.exists({
+      await LuckyTicket.exists({
 
 
 
-        $or: [
+        $or: [
 
 
 
-          {
+          {
 
 
 
-            publicCode: publicCode
+            publicCode: publicCode
 
 
 
-          },
+          },
 
 
 
-          {
+          {
 
 
 
-            secretCode: secretCode
+            secretCode: secretCode
 
 
 
-          }
+          }
 
 
 
-        ]
+        ]
 
 
 
-      });
+      });
 
 
 
@@ -2259,31 +2545,31 @@ async function generateSecureTicket() {
 
 
 
-    // Unique hai to return karo.
+    // Unique hai to return karo.
 
 
 
-    if (!exists) {
+    if (!exists) {
 
 
 
-      return {
+      return {
 
 
 
-        publicCode,
+        publicCode,
 
 
 
-        secretCode
+        secretCode
 
 
 
-      };
+      };
 
 
 
-    }
+    }
 
 
 
@@ -2291,15 +2577,15 @@ async function generateSecureTicket() {
 
 
 
-    // Agar collision hua to while loop
+    // Agar collision hua to while loop
 
 
 
-    // automatically naya code banayega.
+    // automatically naya code banayega.
 
 
 
-  }
+  }
 
 
 
@@ -2331,17 +2617,17 @@ app.post("/api/lucky-draw/tickets/create", async (req, res) => {
 
 
 
-  try {
+  try {
 
 
 
-    const {
+    const {
 
-      userId,
+      userId,
 
-      paymentMethod
+      paymentMethod
 
-    } = req.body;
+    } = req.body;
 
 
 
@@ -2349,15 +2635,15 @@ app.post("/api/lucky-draw/tickets/create", async (req, res) => {
 
 
 
-    // ------------------------------------------
+    // ------------------------------------------
 
 
 
-    // REQUIRED DATA CHECK
+    // REQUIRED DATA CHECK
 
 
 
-    // ------------------------------------------
+    // ------------------------------------------
 
 
 
@@ -2365,27 +2651,27 @@ app.post("/api/lucky-draw/tickets/create", async (req, res) => {
 
 
 
-    if (!userId || !paymentMethod) {
+    if (!userId || !paymentMethod) {
 
 
 
-      return res.status(400).json({
+      return res.status(400).json({
 
 
 
-        success: false,
+        success: false,
 
 
 
-        error: "Required ticket information missing hai."
+        error: "Required ticket information missing hai."
 
 
 
-      });
+      });
 
 
 
-    }
+    }
 
 
 
@@ -2393,15 +2679,15 @@ app.post("/api/lucky-draw/tickets/create", async (req, res) => {
 
 
 
-    // ------------------------------------------
+    // ------------------------------------------
 
 
 
-    // USER ID CHECK
+    // USER ID CHECK
 
 
 
-    // ------------------------------------------
+    // ------------------------------------------
 
 
 
@@ -2409,27 +2695,27 @@ app.post("/api/lucky-draw/tickets/create", async (req, res) => {
 
 
 
-    if (!mongoose.Types.ObjectId.isValid(userId)) {
+    if (!mongoose.Types.ObjectId.isValid(userId)) {
 
 
 
-      return res.status(400).json({
+      return res.status(400).json({
 
 
 
-        success: false,
+        success: false,
 
 
 
-        error: "Invalid User ID."
+        error: "Invalid User ID."
 
 
 
-      });
+      });
 
 
 
-    }
+    }
 
 
 
@@ -2437,15 +2723,15 @@ app.post("/api/lucky-draw/tickets/create", async (req, res) => {
 
 
 
-    // ------------------------------------------
+    // ------------------------------------------
 
 
 
-    // PAYMENT METHOD CHECK
+    // PAYMENT METHOD CHECK
 
 
 
-    // ------------------------------------------
+    // ------------------------------------------
 
 
 
@@ -2453,7 +2739,7 @@ app.post("/api/lucky-draw/tickets/create", async (req, res) => {
 
 
 
-    const allowedPaymentMethods = ["coins"];
+    const allowedPaymentMethods = ["coins"];
 
 
 
@@ -2461,43 +2747,43 @@ app.post("/api/lucky-draw/tickets/create", async (req, res) => {
 
 
 
-    if (!allowedPaymentMethods.includes(paymentMethod)) {
+    if (!allowedPaymentMethods.includes(paymentMethod)) {
 
 
 
-      return res.status(400).json({
+      return res.status(400).json({
 
 
 
-        success: false,
+        success: false,
 
 
 
-        error: "Invalid payment method."
+        error: "Invalid payment method."
 
 
 
-      });
+      });
 
 
 
-    }
+    }
 
 
 
-    // ------------------------------------------
+    // ------------------------------------------
 
-    // SERVER-CONTROLLED CURRENT ROUND
+    // SERVER-CONTROLLED CURRENT ROUND
 
-    // ------------------------------------------
+    // ------------------------------------------
 
 
 
-    const currentRound = await getCurrentLuckyRound();
+    const currentRound = await getCurrentLuckyRound();
 
-    const roundId = currentRound.roundId;
+    const roundId = currentRound.roundId;
 
-    const ticketExpiry = currentRound.endsAt;
+    const ticketExpiry = currentRound.endsAt;
 
 
 
@@ -2507,15 +2793,15 @@ app.post("/api/lucky-draw/tickets/create", async (req, res) => {
 
 
 
-    // ------------------------------------------
+    // ------------------------------------------
 
 
 
-    // DATABASE SE REAL USER FIND KARO
+    // DATABASE SE REAL USER FIND KARO
 
 
 
-    // ------------------------------------------
+    // ------------------------------------------
 
 
 
@@ -2523,7 +2809,7 @@ app.post("/api/lucky-draw/tickets/create", async (req, res) => {
 
 
 
-    const user = await User.findById(userId);
+    const user = await User.findById(userId);
 
 
 
@@ -2531,27 +2817,27 @@ app.post("/api/lucky-draw/tickets/create", async (req, res) => {
 
 
 
-    if (!user) {
+    if (!user) {
 
 
 
-      return res.status(404).json({
+      return res.status(404).json({
 
 
 
-        success: false,
+        success: false,
 
 
 
-        error: "User database mein nahi mila."
+        error: "User database mein nahi mila."
 
 
 
-      });
+      });
 
 
 
-    }
+    }
 
 
 
@@ -2559,15 +2845,15 @@ app.post("/api/lucky-draw/tickets/create", async (req, res) => {
 
 
 
-    // ------------------------------------------
+    // ------------------------------------------
 
 
 
-    // COINS PAYMENT
+    // COINS PAYMENT
 
 
 
-    // ------------------------------------------
+    // ------------------------------------------
 
 
 
@@ -2575,7 +2861,7 @@ app.post("/api/lucky-draw/tickets/create", async (req, res) => {
 
 
 
-    const TICKET_PRICE_COINS = 2000;
+    const TICKET_PRICE_COINS = 2000;
 
 
 
@@ -2583,39 +2869,39 @@ app.post("/api/lucky-draw/tickets/create", async (req, res) => {
 
 
 
-    if (paymentMethod === "coins") {
+    if (paymentMethod === "coins") {
 
 
 
-      if (user.coins < TICKET_PRICE_COINS) {
+      if (user.coins < TICKET_PRICE_COINS) {
 
 
 
-        return res.status(400).json({
+        return res.status(400).json({
 
 
 
-          success: false,
+          success: false,
 
 
 
-          error: "Insufficient coins.",
+          error: "Insufficient coins.",
 
 
 
-          requiredCoins: TICKET_PRICE_COINS,
+          requiredCoins: TICKET_PRICE_COINS,
 
 
 
-          availableCoins: user.coins
+          availableCoins: user.coins
 
 
 
-        });
+        });
 
 
 
-      }
+      }
 
 
 
@@ -2623,7 +2909,7 @@ app.post("/api/lucky-draw/tickets/create", async (req, res) => {
 
 
 
-      user.coins -= TICKET_PRICE_COINS;
+      user.coins -= TICKET_PRICE_COINS;
 
 
 
@@ -2631,11 +2917,11 @@ app.post("/api/lucky-draw/tickets/create", async (req, res) => {
 
 
 
-      await user.save();
+      await user.save();
 
 
 
-    }
+    }
 
 
 
@@ -2643,15 +2929,15 @@ app.post("/api/lucky-draw/tickets/create", async (req, res) => {
 
 
 
-    // ------------------------------------------
+    // ------------------------------------------
 
 
 
-    // GENERATE SECURE UNIQUE TICKET
+    // GENERATE SECURE UNIQUE TICKET
 
 
 
-    // ------------------------------------------
+    // ------------------------------------------
 
 
 
@@ -2659,19 +2945,19 @@ app.post("/api/lucky-draw/tickets/create", async (req, res) => {
 
 
 
-    const {
+    const {
 
 
 
-      publicCode,
+      publicCode,
 
 
 
-      secretCode
+      secretCode
 
 
 
-    } = await generateSecureTicket();
+    } = await generateSecureTicket();
 
 
 
@@ -2679,15 +2965,15 @@ app.post("/api/lucky-draw/tickets/create", async (req, res) => {
 
 
 
-    // ------------------------------------------
+    // ------------------------------------------
 
 
 
-    // DATABASE ME TICKET SAVE
+    // DATABASE ME TICKET SAVE
 
 
 
-    // ------------------------------------------
+    // ------------------------------------------
 
 
 
@@ -2695,11 +2981,11 @@ app.post("/api/lucky-draw/tickets/create", async (req, res) => {
 
 
 
-    const ticket = new LuckyTicket({
+    const ticket = new LuckyTicket({
 
 
 
-      publicCode,
+      publicCode,
 
 
 
@@ -2707,15 +2993,15 @@ app.post("/api/lucky-draw/tickets/create", async (req, res) => {
 
 
 
-      // IMPORTANT:
+      // IMPORTANT:
 
 
 
-      // Ye complete secret ticket sirf DB mein rahega.
+      // Ye complete secret ticket sirf DB mein rahega.
 
 
 
-      secretCode,
+      secretCode,
 
 
 
@@ -2723,7 +3009,7 @@ app.post("/api/lucky-draw/tickets/create", async (req, res) => {
 
 
 
-      userId: String(user._id),
+      userId: String(user._id),
 
 
 
@@ -2731,7 +3017,7 @@ app.post("/api/lucky-draw/tickets/create", async (req, res) => {
 
 
 
-      userName: user.name,
+      userName: user.name,
 
 
 
@@ -2739,7 +3025,7 @@ app.post("/api/lucky-draw/tickets/create", async (req, res) => {
 
 
 
-      phone: user.phone,
+      phone: user.phone,
 
 
 
@@ -2747,7 +3033,7 @@ app.post("/api/lucky-draw/tickets/create", async (req, res) => {
 
 
 
-      roundId: String(roundId),
+      roundId: String(roundId),
 
 
 
@@ -2755,7 +3041,7 @@ app.post("/api/lucky-draw/tickets/create", async (req, res) => {
 
 
 
-      paymentMethod,
+      paymentMethod,
 
 
 
@@ -2763,7 +3049,7 @@ app.post("/api/lucky-draw/tickets/create", async (req, res) => {
 
 
 
-      status: "active",
+      status: "active",
 
 
 
@@ -2771,7 +3057,7 @@ app.post("/api/lucky-draw/tickets/create", async (req, res) => {
 
 
 
-      issuedAt: new Date(),
+      issuedAt: new Date(),
 
 
 
@@ -2779,11 +3065,11 @@ app.post("/api/lucky-draw/tickets/create", async (req, res) => {
 
 
 
-      expiresAt: ticketExpiry
+      expiresAt: ticketExpiry
 
 
 
-    });
+    });
 
 
 
@@ -2791,7 +3077,7 @@ app.post("/api/lucky-draw/tickets/create", async (req, res) => {
 
 
 
-    await ticket.save();
+    await ticket.save();
 
 
 
@@ -2799,15 +3085,15 @@ app.post("/api/lucky-draw/tickets/create", async (req, res) => {
 
 
 
-    // ------------------------------------------
+    // ------------------------------------------
 
 
 
-    // USER KO SECRET CODE MAT BHEJNA
+    // USER KO SECRET CODE MAT BHEJNA
 
 
 
-    // ------------------------------------------
+    // ------------------------------------------
 
 
 
@@ -2815,11 +3101,11 @@ app.post("/api/lucky-draw/tickets/create", async (req, res) => {
 
 
 
-    return res.status(201).json({
+    return res.status(201).json({
 
 
 
-      success: true,
+      success: true,
 
 
 
@@ -2827,7 +3113,7 @@ app.post("/api/lucky-draw/tickets/create", async (req, res) => {
 
 
 
-      message: "Lucky Draw ticket successfully issued.",
+      message: "Lucky Draw ticket successfully issued.",
 
 
 
@@ -2835,11 +3121,11 @@ app.post("/api/lucky-draw/tickets/create", async (req, res) => {
 
 
 
-      ticket: {
+      ticket: {
 
 
 
-        id: ticket._id,
+        id: ticket._id,
 
 
 
@@ -2847,15 +3133,15 @@ app.post("/api/lucky-draw/tickets/create", async (req, res) => {
 
 
 
-        // User ko sirf ye code milega:
+        // User ko sirf ye code milega:
 
 
 
-        // SK-XXXXXXXX
+        // SK-XXXXXXXX
 
 
 
-        code: ticket.publicCode,
+        code: ticket.publicCode,
 
 
 
@@ -2863,7 +3149,7 @@ app.post("/api/lucky-draw/tickets/create", async (req, res) => {
 
 
 
-        roundId: ticket.roundId,
+        roundId: ticket.roundId,
 
 
 
@@ -2871,7 +3157,7 @@ app.post("/api/lucky-draw/tickets/create", async (req, res) => {
 
 
 
-        status: ticket.status,
+        status: ticket.status,
 
 
 
@@ -2879,7 +3165,7 @@ app.post("/api/lucky-draw/tickets/create", async (req, res) => {
 
 
 
-        issuedAt: ticket.issuedAt,
+        issuedAt: ticket.issuedAt,
 
 
 
@@ -2887,11 +3173,11 @@ app.post("/api/lucky-draw/tickets/create", async (req, res) => {
 
 
 
-        expiresAt: ticket.expiresAt
+        expiresAt: ticket.expiresAt
 
 
 
-      },
+      },
 
 
 
@@ -2899,11 +3185,11 @@ app.post("/api/lucky-draw/tickets/create", async (req, res) => {
 
 
 
-      coins: user.coins
+      coins: user.coins
 
 
 
-    });
+    });
 
 
 
@@ -2911,23 +3197,23 @@ app.post("/api/lucky-draw/tickets/create", async (req, res) => {
 
 
 
-  } catch (err) {
+  } catch (err) {
 
 
 
-    console.error(
+    console.error(
 
 
 
-      "Lucky Draw ticket create error:",
+      "Lucky Draw ticket create error:",
 
 
 
-      err
+      err
 
 
 
-    );
+    );
 
 
 
@@ -2935,23 +3221,23 @@ app.post("/api/lucky-draw/tickets/create", async (req, res) => {
 
 
 
-    return res.status(500).json({
+    return res.status(500).json({
 
 
 
-      success: false,
+      success: false,
 
 
 
-      error: "Ticket create nahi ho saka."
+      error: "Ticket create nahi ho saka."
 
 
 
-    });
+    });
 
 
 
-  }
+  }
 
 
 
@@ -2983,17 +3269,17 @@ app.post("/api/lucky-draw/tickets/verify", async (req, res) => {
 
 
 
-  try {
+  try {
 
 
 
-    const {
+    const {
 
-      code,
+      code,
 
-      userId
+      userId
 
-    } = req.body;
+    } = req.body;
 
 
 
@@ -3001,15 +3287,15 @@ app.post("/api/lucky-draw/tickets/verify", async (req, res) => {
 
 
 
-    // ------------------------------------------
+    // ------------------------------------------
 
 
 
-    // REQUIRED DATA
+    // REQUIRED DATA
 
 
 
-    // ------------------------------------------
+    // ------------------------------------------
 
 
 
@@ -3017,31 +3303,31 @@ app.post("/api/lucky-draw/tickets/verify", async (req, res) => {
 
 
 
-    if (!code || !userId) {
+    if (!code || !userId) {
 
 
 
-      return res.status(400).json({
+      return res.status(400).json({
 
 
 
-        success: false,
+        success: false,
 
 
 
-        valid: false,
+        valid: false,
 
 
 
-        error: "Ticket code aur User ID required hain."
+        error: "Ticket code aur User ID required hain."
 
 
 
-      });
+      });
 
 
 
-    }
+    }
 
 
 
@@ -3049,15 +3335,15 @@ app.post("/api/lucky-draw/tickets/verify", async (req, res) => {
 
 
 
-    // ------------------------------------------
+    // ------------------------------------------
 
 
 
-    // USER ID VALIDATION
+    // USER ID VALIDATION
 
 
 
-    // ------------------------------------------
+    // ------------------------------------------
 
 
 
@@ -3065,31 +3351,31 @@ app.post("/api/lucky-draw/tickets/verify", async (req, res) => {
 
 
 
-    if (!mongoose.Types.ObjectId.isValid(userId)) {
+    if (!mongoose.Types.ObjectId.isValid(userId)) {
 
 
 
-      return res.status(400).json({
+      return res.status(400).json({
 
 
 
-        success: false,
+        success: false,
 
 
 
-        valid: false,
+        valid: false,
 
 
 
-        error: "Invalid User ID."
+        error: "Invalid User ID."
 
 
 
-      });
+      });
 
 
 
-    }
+    }
 
 
 
@@ -3097,15 +3383,15 @@ app.post("/api/lucky-draw/tickets/verify", async (req, res) => {
 
 
 
-    // ------------------------------------------
+    // ------------------------------------------
 
 
 
-    // NORMALIZE PUBLIC CODE
+    // NORMALIZE PUBLIC CODE
 
 
 
-    // ------------------------------------------
+    // ------------------------------------------
 
 
 
@@ -3113,15 +3399,15 @@ app.post("/api/lucky-draw/tickets/verify", async (req, res) => {
 
 
 
-    const publicCode = String(code)
+    const publicCode = String(code)
 
 
 
-      .trim()
+      .trim()
 
 
 
-      .toUpperCase();
+      .toUpperCase();
 
 
 
@@ -3129,11 +3415,11 @@ app.post("/api/lucky-draw/tickets/verify", async (req, res) => {
 
 
 
-    // Expected:
+    // Expected:
 
 
 
-    // SK-8F4K4KO2
+    // SK-8F4K4KO2
 
 
 
@@ -3141,35 +3427,35 @@ app.post("/api/lucky-draw/tickets/verify", async (req, res) => {
 
 
 
-    if (!/^SK-[A-Z0-9]{8}$/.test(publicCode)) {
+    if (!/^SK-[A-Z0-9]{8}$/.test(publicCode)) {
 
 
 
-      return res.status(400).json({
+      return res.status(400).json({
 
 
 
-        success: false,
+        success: false,
 
 
 
-        valid: false,
+        valid: false,
 
 
 
-        status: "invalid",
+        status: "invalid",
 
 
 
-        error: "Ticket format invalid hai."
+        error: "Ticket format invalid hai."
 
 
 
-      });
+      });
 
 
 
-    }
+    }
 
 
 
@@ -3177,23 +3463,23 @@ app.post("/api/lucky-draw/tickets/verify", async (req, res) => {
 
 
 
-    // ------------------------------------------
+    // ------------------------------------------
 
 
 
-    // FIND TICKET
+    // FIND TICKET
 
 
 
-    // IMPORTANT:
+    // IMPORTANT:
 
 
 
-    // secretCode se verification nahi hogi.
+    // secretCode se verification nahi hogi.
 
 
 
-    // ------------------------------------------
+    // ------------------------------------------
 
 
 
@@ -3201,15 +3487,15 @@ app.post("/api/lucky-draw/tickets/verify", async (req, res) => {
 
 
 
-    const ticket = await LuckyTicket.findOne({
+    const ticket = await LuckyTicket.findOne({
 
 
 
-      publicCode
+      publicCode
 
 
 
-    });
+    });
 
 
 
@@ -3217,35 +3503,35 @@ app.post("/api/lucky-draw/tickets/verify", async (req, res) => {
 
 
 
-    if (!ticket) {
+    if (!ticket) {
 
 
 
-      return res.status(404).json({
+      return res.status(404).json({
 
 
 
-        success: false,
+        success: false,
 
 
 
-        valid: false,
+        valid: false,
 
 
 
-        status: "invalid",
+        status: "invalid",
 
 
 
-        error: "Ticket database mein nahi mila."
+        error: "Ticket database mein nahi mila."
 
 
 
-      });
+      });
 
 
 
-    }
+    }
 
 
 
@@ -3253,15 +3539,15 @@ app.post("/api/lucky-draw/tickets/verify", async (req, res) => {
 
 
 
-    // ------------------------------------------
+    // ------------------------------------------
 
 
 
-    // CHECK TICKET OWNER
+    // CHECK TICKET OWNER
 
 
 
-    // ------------------------------------------
+    // ------------------------------------------
 
 
 
@@ -3269,43 +3555,43 @@ app.post("/api/lucky-draw/tickets/verify", async (req, res) => {
 
 
 
-    if (
+    if (
 
 
 
-      String(ticket.userId) !== String(userId)
+      String(ticket.userId) !== String(userId)
 
 
 
-    ) {
+    ) {
 
 
 
-      return res.status(403).json({
+      return res.status(403).json({
 
 
 
-        success: false,
+        success: false,
 
 
 
-        valid: false,
+        valid: false,
 
 
 
-        status: "invalid",
+        status: "invalid",
 
 
 
-        error: "Yeh ticket is account ka nahi hai."
+        error: "Yeh ticket is account ka nahi hai."
 
 
 
-      });
+      });
 
 
 
-    }
+    }
 
 
 
@@ -3313,45 +3599,45 @@ app.post("/api/lucky-draw/tickets/verify", async (req, res) => {
 
 
 
-    // ------------------------------------------
+    // ------------------------------------------
 
-    // CHECK SERVER-CONTROLLED CURRENT ROUND
+    // CHECK SERVER-CONTROLLED CURRENT ROUND
 
-    // ------------------------------------------
+    // ------------------------------------------
 
 
 
-    const currentRound = await getCurrentLuckyRound();
+    const currentRound = await getCurrentLuckyRound();
 
 
 
-    if (String(ticket.roundId) !== String(currentRound.roundId)) {
+    if (String(ticket.roundId) !== String(currentRound.roundId)) {
 
-      return res.status(400).json({
+      return res.status(400).json({
 
-        success: false,
+        success: false,
 
-        valid: false,
+        valid: false,
 
-        status: "wrong_round",
+        status: "wrong_round",
 
-        error: "Yeh ticket current Lucky Draw round ka nahi hai."
+        error: "Yeh ticket current Lucky Draw round ka nahi hai."
 
-      });
+      });
 
-    }
+    }
 
 
 
-    // ------------------------------------------
+    // ------------------------------------------
 
 
 
-    // EXPIRY CHECK
+    // EXPIRY CHECK
 
 
 
-    // ------------------------------------------
+    // ------------------------------------------
 
 
 
@@ -3359,7 +3645,7 @@ app.post("/api/lucky-draw/tickets/verify", async (req, res) => {
 
 
 
-    const now = new Date();
+    const now = new Date();
 
 
 
@@ -3367,23 +3653,23 @@ app.post("/api/lucky-draw/tickets/verify", async (req, res) => {
 
 
 
-    if (
+    if (
 
 
 
-      ticket.expiresAt &&
+      ticket.expiresAt &&
 
 
 
-      new Date(ticket.expiresAt) <= now
+      new Date(ticket.expiresAt) <= now
 
 
 
-    ) {
+    ) {
 
 
 
-      // Database mein bhi expired kar do.
+      // Database mein bhi expired kar do.
 
 
 
@@ -3391,11 +3677,11 @@ app.post("/api/lucky-draw/tickets/verify", async (req, res) => {
 
 
 
-      if (ticket.status === "active") {
+      if (ticket.status === "active") {
 
 
 
-        ticket.status = "expired";
+        ticket.status = "expired";
 
 
 
@@ -3403,11 +3689,11 @@ app.post("/api/lucky-draw/tickets/verify", async (req, res) => {
 
 
 
-        await ticket.save();
+        await ticket.save();
 
 
 
-      }
+      }
 
 
 
@@ -3415,31 +3701,31 @@ app.post("/api/lucky-draw/tickets/verify", async (req, res) => {
 
 
 
-      return res.status(400).json({
+      return res.status(400).json({
 
 
 
-        success: false,
+        success: false,
 
 
 
-        valid: false,
+        valid: false,
 
 
 
-        status: "expired",
+        status: "expired",
 
 
 
-        error: "Yeh ticket expire ho chuka hai."
+        error: "Yeh ticket expire ho chuka hai."
 
 
 
-      });
+      });
 
 
 
-    }
+    }
 
 
 
@@ -3447,15 +3733,15 @@ app.post("/api/lucky-draw/tickets/verify", async (req, res) => {
 
 
 
-    // ------------------------------------------
+    // ------------------------------------------
 
 
 
-    // STATUS CHECK
+    // STATUS CHECK
 
 
 
-    // ------------------------------------------
+    // ------------------------------------------
 
 
 
@@ -3463,35 +3749,35 @@ app.post("/api/lucky-draw/tickets/verify", async (req, res) => {
 
 
 
-    if (ticket.status === "expired") {
+    if (ticket.status === "expired") {
 
 
 
-      return res.status(400).json({
+      return res.status(400).json({
 
 
 
-        success: false,
+        success: false,
 
 
 
-        valid: false,
+        valid: false,
 
 
 
-        status: "expired",
+        status: "expired",
 
 
 
-        error: "Yeh ticket expire ho chuka hai."
+        error: "Yeh ticket expire ho chuka hai."
 
 
 
-      });
+      });
 
 
 
-    }
+    }
 
 
 
@@ -3499,35 +3785,35 @@ app.post("/api/lucky-draw/tickets/verify", async (req, res) => {
 
 
 
-    if (ticket.status === "cancelled") {
+    if (ticket.status === "cancelled") {
 
 
 
-      return res.status(400).json({
+      return res.status(400).json({
 
 
 
-        success: false,
+        success: false,
 
 
 
-        valid: false,
+        valid: false,
 
 
 
-        status: "cancelled",
+        status: "cancelled",
 
 
 
-        error: "Yeh ticket cancel ho chuka hai."
+        error: "Yeh ticket cancel ho chuka hai."
 
 
 
-      });
+      });
 
 
 
-    }
+    }
 
 
 
@@ -3535,11 +3821,11 @@ app.post("/api/lucky-draw/tickets/verify", async (req, res) => {
 
 
 
-    // Winner ticket valid historical result ho sakta hai,
+    // Winner ticket valid historical result ho sakta hai,
 
 
 
-    // lekin active draw entry nahi hai.
+    // lekin active draw entry nahi hai.
 
 
 
@@ -3547,27 +3833,27 @@ app.post("/api/lucky-draw/tickets/verify", async (req, res) => {
 
 
 
-    if (ticket.status === "winner") {
+    if (ticket.status === "winner") {
 
 
 
-      return res.status(200).json({
+      return res.status(200).json({
 
 
 
-        success: true,
+        success: true,
 
 
 
-        valid: false,
+        valid: false,
 
 
 
-        status: "winner",
+        status: "winner",
 
 
 
-        message: "Yeh ticket previous winning ticket hai.",
+        message: "Yeh ticket previous winning ticket hai.",
 
 
 
@@ -3575,35 +3861,35 @@ app.post("/api/lucky-draw/tickets/verify", async (req, res) => {
 
 
 
-        ticket: {
+        ticket: {
 
 
 
-          code: ticket.publicCode,
+          code: ticket.publicCode,
 
 
 
-          roundId: ticket.roundId,
+          roundId: ticket.roundId,
 
 
 
-          issuedAt: ticket.issuedAt,
+          issuedAt: ticket.issuedAt,
 
 
 
-          expiresAt: ticket.expiresAt
+          expiresAt: ticket.expiresAt
 
 
 
-        }
+        }
 
 
 
-      });
+      });
 
 
 
-    }
+    }
 
 
 
@@ -3611,15 +3897,15 @@ app.post("/api/lucky-draw/tickets/verify", async (req, res) => {
 
 
 
-    // ------------------------------------------
+    // ------------------------------------------
 
 
 
-    // ACTIVE TICKET
+    // ACTIVE TICKET
 
 
 
-    // ------------------------------------------
+    // ------------------------------------------
 
 
 
@@ -3627,35 +3913,35 @@ app.post("/api/lucky-draw/tickets/verify", async (req, res) => {
 
 
 
-    if (ticket.status !== "active") {
+    if (ticket.status !== "active") {
 
 
 
-      return res.status(400).json({
+      return res.status(400).json({
 
 
 
-        success: false,
+        success: false,
 
 
 
-        valid: false,
+        valid: false,
 
 
 
-        status: "invalid",
+        status: "invalid",
 
 
 
-        error: "Ticket active nahi hai."
+        error: "Ticket active nahi hai."
 
 
 
-      });
+      });
 
 
 
-    }
+    }
 
 
 
@@ -3663,15 +3949,15 @@ app.post("/api/lucky-draw/tickets/verify", async (req, res) => {
 
 
 
-    // ------------------------------------------
+    // ------------------------------------------
 
 
 
-    // SUCCESS
+    // SUCCESS
 
 
 
-    // ------------------------------------------
+    // ------------------------------------------
 
 
 
@@ -3679,19 +3965,19 @@ app.post("/api/lucky-draw/tickets/verify", async (req, res) => {
 
 
 
-    return res.status(200).json({
+    return res.status(200).json({
 
 
 
-      success: true,
+      success: true,
 
 
 
-      valid: true,
+      valid: true,
 
 
 
-      status: "active",
+      status: "active",
 
 
 
@@ -3699,11 +3985,11 @@ app.post("/api/lucky-draw/tickets/verify", async (req, res) => {
 
 
 
-      message:
+      message:
 
 
 
-        "Ticket verified successfully. Lucky Draw entry active hai.",
+        "Ticket verified successfully. Lucky Draw entry active hai.",
 
 
 
@@ -3711,11 +3997,11 @@ app.post("/api/lucky-draw/tickets/verify", async (req, res) => {
 
 
 
-      ticket: {
+      ticket: {
 
 
 
-        code: ticket.publicCode,
+        code: ticket.publicCode,
 
 
 
@@ -3723,7 +4009,7 @@ app.post("/api/lucky-draw/tickets/verify", async (req, res) => {
 
 
 
-        userName: ticket.userName,
+        userName: ticket.userName,
 
 
 
@@ -3731,7 +4017,7 @@ app.post("/api/lucky-draw/tickets/verify", async (req, res) => {
 
 
 
-        roundId: ticket.roundId,
+        roundId: ticket.roundId,
 
 
 
@@ -3739,11 +4025,11 @@ app.post("/api/lucky-draw/tickets/verify", async (req, res) => {
 
 
 
-        paymentMethod:
+        paymentMethod:
 
 
 
-          ticket.paymentMethod,
+          ticket.paymentMethod,
 
 
 
@@ -3751,11 +4037,11 @@ app.post("/api/lucky-draw/tickets/verify", async (req, res) => {
 
 
 
-        issuedAt:
+        issuedAt:
 
 
 
-          ticket.issuedAt,
+          ticket.issuedAt,
 
 
 
@@ -3763,19 +4049,19 @@ app.post("/api/lucky-draw/tickets/verify", async (req, res) => {
 
 
 
-        expiresAt:
+        expiresAt:
 
 
 
-          ticket.expiresAt
+          ticket.expiresAt
 
 
 
-      }
+      }
 
 
 
-    });
+    });
 
 
 
@@ -3783,23 +4069,23 @@ app.post("/api/lucky-draw/tickets/verify", async (req, res) => {
 
 
 
-  } catch (err) {
+  } catch (err) {
 
 
 
-    console.error(
+    console.error(
 
 
 
-      "Lucky Draw ticket verification error:",
+      "Lucky Draw ticket verification error:",
 
 
 
-      err
+      err
 
 
 
-    );
+    );
 
 
 
@@ -3807,27 +4093,27 @@ app.post("/api/lucky-draw/tickets/verify", async (req, res) => {
 
 
 
-    return res.status(500).json({
+    return res.status(500).json({
 
 
 
-      success: false,
+      success: false,
 
 
 
-      valid: false,
+      valid: false,
 
 
 
-      error: "Ticket verify nahi ho saka."
+      error: "Ticket verify nahi ho saka."
 
 
 
-    });
+    });
 
 
 
-  }
+  }
 
 
 
@@ -3839,7 +4125,7 @@ app.post("/api/lucky-draw/tickets/verify", async (req, res) => {
 
 
 
-      // ======================================================
+      // ======================================================
 
 
 
@@ -3859,23 +4145,23 @@ app.get(
 
 
 
-  "/api/lucky-draw/current-round",
+  "/api/lucky-draw/current-round",
 
 
 
-  async (req, res) => {
+  async (req, res) => {
 
 
 
-    try {
+    try {
 
 
 
-      const round =
+      const round =
 
 
 
-        await getCurrentLuckyRound();
+        await getCurrentLuckyRound();
 
 
 
@@ -3883,11 +4169,11 @@ app.get(
 
 
 
-      return res.status(200).json({
+      return res.status(200).json({
 
 
 
-        success: true,
+        success: true,
 
 
 
@@ -3895,31 +4181,31 @@ app.get(
 
 
 
-        round: {
+        round: {
 
 
 
-          roundId: round.roundId,
+          roundId: round.roundId,
 
 
 
-          status: round.status,
+          status: round.status,
 
 
 
-          startsAt: round.startsAt,
+          startsAt: round.startsAt,
 
 
 
-          endsAt: round.endsAt
+          endsAt: round.endsAt
 
 
 
-        }
+        }
 
 
 
-      });
+      });
 
 
 
@@ -3927,23 +4213,23 @@ app.get(
 
 
 
-    } catch (err) {
+    } catch (err) {
 
 
 
-      console.error(
+      console.error(
 
 
 
-        "Current Lucky Draw round error:",
+        "Current Lucky Draw round error:",
 
 
 
-        err
+        err
 
 
 
-      );
+      );
 
 
 
@@ -3951,31 +4237,31 @@ app.get(
 
 
 
-      return res.status(500).json({
+      return res.status(500).json({
 
 
 
-        success: false,
+        success: false,
 
 
 
-        error:
+        error:
 
 
 
-          "Current Lucky Draw round load nahi ho saka."
+          "Current Lucky Draw round load nahi ho saka."
 
 
 
-      });
+      });
 
 
 
-    }
+    }
 
 
 
-  }
+  }
 
 
 
@@ -3991,141 +4277,141 @@ app.get(
 
 app.get(
 
-  "/api/lucky-draw/latest-winner",
+  "/api/lucky-draw/latest-winner",
 
-  async (req, res) => {
+  async (req, res) => {
 
-    try {
+    try {
 
-      const round =
+      const round =
 
-        await LuckyRound.findOne({
+        await LuckyRound.findOne({
 
-          status: "completed",
+          status: "completed",
 
 
 
-          winnerTicketId: {
+          winnerTicketId: {
 
-            $ne: null
+            $ne: null
 
-          }
+          }
 
-        })
+        })
 
-          .sort({
+          .sort({
 
-            completedAt: -1
+            completedAt: -1
 
-          })
+          })
 
-          .lean();
+          .lean();
 
 
 
-      if (!round) {
+      if (!round) {
 
-        return res.status(404).json({
+        return res.status(404).json({
 
-          success: false,
+          success: false,
 
-          message:
+          message:
 
-            "Abhi koi Lucky Draw winner available nahi hai."
+            "Abhi koi Lucky Draw winner available nahi hai."
 
-        });
+        });
 
-      }
+      }
 
 
 
-      const winnerTicket =
+      const winnerTicket =
 
-        await LuckyTicket.findById(
+        await LuckyTicket.findById(
 
-          round.winnerTicketId
+          round.winnerTicketId
 
-        ).lean();
+        ).lean();
 
 
 
-      if (!winnerTicket) {
+      if (!winnerTicket) {
 
-        return res.status(404).json({
+        return res.status(404).json({
 
-          success: false,
+          success: false,
 
-          message:
+          message:
 
-            "Winner ticket database mein nahi mila."
+            "Winner ticket database mein nahi mila."
 
-        });
+        });
 
-      }
+      }
 
 
 
-      return res.status(200).json({
+      return res.status(200).json({
 
-        success: true,
+        success: true,
 
 
 
-        winner: {
+        winner: {
 
-          roundId:
+          roundId:
 
-            round.roundId,
+            round.roundId,
 
 
 
-          ticketCode:
+          ticketCode:
 
-            winnerTicket.publicCode,
+            winnerTicket.publicCode,
 
 
 
-          userName:
+          userName:
 
-            winnerTicket.userName,
+            winnerTicket.userName,
 
 
 
-          completedAt:
+          completedAt:
 
-            round.completedAt
+            round.completedAt
 
-        }
+        }
 
-      });
+      });
 
 
 
-    } catch (err) {
+    } catch (err) {
 
-      console.error(
+      console.error(
 
-        "Latest Lucky Draw winner error:",
+        "Latest Lucky Draw winner error:",
 
-        err
+        err
 
-      );
+      );
 
 
 
-      return res.status(500).json({
+      return res.status(500).json({
 
-        success: false,
+        success: false,
 
-        error:
+        error:
 
-          "Lucky Draw winner load nahi ho saka."
+          "Lucky Draw winner load nahi ho saka."
 
-      });
+      });
 
-    }
+    }
 
-  }
+  }
 
 );
 
@@ -4149,11 +4435,11 @@ app.post("/api/auth/signup", async (req, res) => {
 
 
 
-  try {
+  try {
 
 
 
-    const { name, phone, password } = req.body;
+    const { name, phone, password } = req.body;
 
 
 
@@ -4161,7 +4447,7 @@ app.post("/api/auth/signup", async (req, res) => {
 
 
 
-    const existingUser = await User.findOne({ phone });
+    const existingUser = await User.findOne({ phone });
 
 
 
@@ -4169,23 +4455,23 @@ app.post("/api/auth/signup", async (req, res) => {
 
 
 
-    if (existingUser) {
+    if (existingUser) {
 
 
 
-      return res.status(400).json({
+      return res.status(400).json({
 
 
 
-        error: "Yeh phone number pehle se registered hai!"
+        error: "Yeh phone number pehle se registered hai!"
 
 
 
-      });
+      });
 
 
 
-    }
+    }
 
 
 
@@ -4193,27 +4479,27 @@ app.post("/api/auth/signup", async (req, res) => {
 
 
 
-    const newUser = new User({
+    const newUser = new User({
 
 
 
-      name,
+      name,
 
 
 
-      phone,
+      phone,
 
 
 
-      password,
+      password,
 
 
 
-      coins: 50
+      coins: 50
 
 
 
-    });
+    });
 
 
 
@@ -4221,7 +4507,7 @@ app.post("/api/auth/signup", async (req, res) => {
 
 
 
-    await newUser.save();
+    await newUser.save();
 
 
 
@@ -4229,15 +4515,15 @@ app.post("/api/auth/signup", async (req, res) => {
 
 
 
-    res.status(201).json({
+    res.status(201).json({
 
 
 
-      success: true,
+      success: true,
 
 
 
-      message: "Account successfully create ho gaya!",
+      message: "Account successfully create ho gaya!",
 
 
 
@@ -4245,51 +4531,52 @@ app.post("/api/auth/signup", async (req, res) => {
 
 
 
-      user: {
+      user: {
 
 
 
-        id: newUser._id,
+        id: newUser._id,
 
 
 
-        name: newUser.name,
+        name: newUser.name,
 
 
 
-        phone: newUser.phone,
+        phone: newUser.phone,
 
 
 
-        coins: newUser.coins
+        coins: newUser.coins,
+        role: isAdminPhone(newUser.phone) ? "admin" : "user"
 
 
 
-      }
+      }
 
 
 
-    });
+    });
 
 
 
-  } catch (err) {
+  } catch (err) {
 
 
 
-    res.status(500).json({
+    res.status(500).json({
 
 
 
-      error: "Server error: " + err.message
+      error: "Server error: " + err.message
 
 
 
-    });
+    });
 
 
 
-  }
+  }
 
 
 
@@ -4321,11 +4608,11 @@ app.post("/api/auth/login", async (req, res) => {
 
 
 
-  try {
+  try {
 
 
 
-    const { phone, password } = req.body;
+    const { phone, password } = req.body;
 
 
 
@@ -4333,7 +4620,7 @@ app.post("/api/auth/login", async (req, res) => {
 
 
 
-    const user = await User.findOne({ phone });
+    const user = await User.findOne({ phone });
 
 
 
@@ -4341,23 +4628,23 @@ app.post("/api/auth/login", async (req, res) => {
 
 
 
-    if (!user) {
+    if (!user) {
 
 
 
-      return res.status(404).json({
+      return res.status(404).json({
 
 
 
-        error: "Yeh phone number register nahi hai!"
+        error: "Yeh phone number register nahi hai!"
 
 
 
-      });
+      });
 
 
 
-    }
+    }
 
 
 
@@ -4365,23 +4652,23 @@ app.post("/api/auth/login", async (req, res) => {
 
 
 
-    if (user.password !== password) {
+    if (user.password !== password) {
 
 
 
-      return res.status(400).json({
+      return res.status(400).json({
 
 
 
-        error: "Ghalat Password!"
+        error: "Ghalat Password!"
 
 
 
-      });
+      });
 
 
 
-    }
+    }
 
 
 
@@ -4389,15 +4676,15 @@ app.post("/api/auth/login", async (req, res) => {
 
 
 
-    res.status(200).json({
+    res.status(200).json({
 
 
 
-      success: true,
+      success: true,
 
 
 
-      message: "Login successful!",
+      message: "Login successful!",
 
 
 
@@ -4405,51 +4692,52 @@ app.post("/api/auth/login", async (req, res) => {
 
 
 
-      user: {
+      user: {
 
 
 
-        id: user._id,
+        id: user._id,
 
 
 
-        name: user.name,
+        name: user.name,
 
 
 
-        phone: user.phone,
+        phone: user.phone,
 
 
 
-        coins: user.coins
+        coins: user.coins,
+        role: isAdminPhone(user.phone) ? "admin" : "user"
 
 
 
-      }
+      }
 
 
 
-    });
+    });
 
 
 
-  } catch (err) {
+  } catch (err) {
 
 
 
-    res.status(500).json({
+    res.status(500).json({
 
 
 
-      error: "Server error: " + err.message
+      error: "Server error: " + err.message
 
 
 
-    });
+    });
 
 
 
-  }
+  }
 
 
 
@@ -4481,19 +4769,19 @@ app.get("/", (req, res) => {
 
 
 
-  res.status(200).json({
+  res.status(200).json({
 
 
 
-    success: true,
+    success: true,
 
 
 
-    message: "🚀 SAMATKAAR Backend is running successfully!"
+    message: "🚀 SAMATKAAR Backend is running successfully!"
 
 
 
-  });
+  });
 
 
 
@@ -4563,95 +4851,6 @@ const socketToUser = new Map();
 
 const pendingChallenges = new Map();
 
-// Server-authoritative game turn clocks.
-// The browser only DISPLAYS this clock; the server owns the deadline.
-const gameRooms = new Map();
-const TURN_DURATION_MS = 40 * 1000;
-
-function createServerTurnState(roomId, player1, player2) {
-  const players = [player1, player2].filter(Boolean);
-  if (players.length < 2) return null;
-
-  // Server chooses once, so both browsers always get the same first turn.
-  const currentTurnIndex = crypto.randomInt(0, players.length);
-  const now = Date.now();
-  const state = {
-    roomId,
-    players: players.map((p) => ({
-      userId: normalizeId(p.userId || p.id),
-      socketId: p.socketId
-    })),
-    currentTurnIndex,
-    turnNumber: 1,
-    turnStartedAt: now,
-    turnEndsAt: now + TURN_DURATION_MS,
-    timer: null
-  };
-
-  gameRooms.set(roomId, state);
-  scheduleServerTurnTimeout(roomId);
-  return state;
-}
-
-function publicTurnState(state) {
-  if (!state) return null;
-  const current = state.players[state.currentTurnIndex];
-  return {
-    roomId: state.roomId,
-    currentTurnUserId: current?.userId || "",
-    currentTurnSocketId: current?.socketId || "",
-    turnNumber: state.turnNumber,
-    turnStartedAt: state.turnStartedAt,
-    turnEndsAt: state.turnEndsAt,
-    serverNow: Date.now(),
-    turnDurationMs: TURN_DURATION_MS
-  };
-}
-
-function scheduleServerTurnTimeout(roomId) {
-  const state = gameRooms.get(roomId);
-  if (!state) return;
-  if (state.timer) clearTimeout(state.timer);
-
-  const delay = Math.max(0, state.turnEndsAt - Date.now());
-  state.timer = setTimeout(() => {
-    const latest = gameRooms.get(roomId);
-    if (!latest) return;
-
-    const expiredPlayer = latest.players[latest.currentTurnIndex];
-    io.to(roomId).emit("turn_timeout", {
-      ...publicTurnState(latest),
-      expiredUserId: expiredPlayer?.userId || "",
-      expiredSocketId: expiredPlayer?.socketId || ""
-    });
-
-    advanceServerTurn(roomId, "timeout");
-  }, delay + 10);
-}
-
-function advanceServerTurn(roomId, reason = "move_complete") {
-  const state = gameRooms.get(roomId);
-  if (!state) return null;
-  if (state.timer) clearTimeout(state.timer);
-
-  state.currentTurnIndex = (state.currentTurnIndex + 1) % state.players.length;
-  state.turnNumber += 1;
-  state.turnStartedAt = Date.now();
-  state.turnEndsAt = state.turnStartedAt + TURN_DURATION_MS;
-
-  scheduleServerTurnTimeout(roomId);
-  const turn = publicTurnState(state);
-  io.to(roomId).emit("turn_state", { ...turn, reason });
-  return turn;
-}
-
-function destroyServerTurnState(roomId) {
-  const state = gameRooms.get(roomId);
-  if (state?.timer) clearTimeout(state.timer);
-  gameRooms.delete(roomId);
-}
-
-
 
 
 
@@ -4678,15 +4877,15 @@ function normalizeId(value) {
 
 
 
-  if (value === undefined || value === null) {
+  if (value === undefined || value === null) {
 
 
 
-    return "";
+    return "";
 
 
 
-  }
+  }
 
 
 
@@ -4694,7 +4893,7 @@ function normalizeId(value) {
 
 
 
-  return String(value);
+  return String(value);
 
 
 
@@ -4726,15 +4925,15 @@ function removeFromQueue(socketId) {
 
 
 
-  waitingQueue = waitingQueue.filter(
+  waitingQueue = waitingQueue.filter(
 
 
 
-    (player) => player.socketId !== socketId
+    (player) => player.socketId !== socketId
 
 
 
-  );
+  );
 
 
 
@@ -4766,7 +4965,7 @@ function getOnlinePlayerByUserId(userId) {
 
 
 
-  const targetId = normalizeId(userId);
+  const targetId = normalizeId(userId);
 
 
 
@@ -4774,23 +4973,23 @@ function getOnlinePlayerByUserId(userId) {
 
 
 
-  for (const player of onlinePlayers.values()) {
+  for (const player of onlinePlayers.values()) {
 
 
 
-    if (normalizeId(player.userId) === targetId) {
+    if (normalizeId(player.userId) === targetId) {
 
 
 
-      return player;
+      return player;
 
 
 
-    }
+    }
 
 
 
-  }
+  }
 
 
 
@@ -4798,7 +4997,7 @@ function getOnlinePlayerByUserId(userId) {
 
 
 
-  return null;
+  return null;
 
 
 
@@ -4830,7 +5029,7 @@ function makeRoomId(prefix, socketA, socketB) {
 
 
 
-  return `${prefix}_${Date.now()}_${socketA}_${socketB}`;
+  return `${prefix}_${Date.now()}_${socketA}_${socketB}`;
 
 
 
@@ -4862,19 +5061,19 @@ io.on("connection", (socket) => {
 
 
 
-  console.log(
+  console.log(
 
 
 
-    "✅ Ek user successfully connect ho gaya:",
+    "✅ Ek user successfully connect ho gaya:",
 
 
 
-    socket.id
+    socket.id
 
 
 
-  );
+  );
 
 
 
@@ -4882,15 +5081,15 @@ io.on("connection", (socket) => {
 
 
 
-  // ====================================================
+  // ====================================================
 
 
 
-  // 1. REGISTER PLAYER AS ONLINE
+  // 1. REGISTER PLAYER AS ONLINE
 
 
 
-  // ====================================================
+  // ====================================================
 
 
 
@@ -4898,15 +5097,15 @@ io.on("connection", (socket) => {
 
 
 
-  socket.on("register_player", async (data = {}) => {
+  socket.on("register_player", async (data = {}) => {
 
 
 
-    try {
+    try {
 
 
 
-      const userId = normalizeId(data.userId);
+      const userId = normalizeId(data.userId);
 
 
 
@@ -4914,19 +5113,19 @@ io.on("connection", (socket) => {
 
 
 
-      if (!userId) {
+      if (!userId) {
 
 
 
-        socket.emit("realtime_error", {
+        socket.emit("realtime_error", {
 
 
 
-          message: "User ID missing hai."
+          message: "User ID missing hai."
 
 
 
-        });
+        });
 
 
 
@@ -4934,11 +5133,11 @@ io.on("connection", (socket) => {
 
 
 
-        return;
+        return;
 
 
 
-      }
+      }
 
 
 
@@ -4946,7 +5145,7 @@ io.on("connection", (socket) => {
 
 
 
-      let dbUser = null;
+      let dbUser = null;
 
 
 
@@ -4954,23 +5153,23 @@ io.on("connection", (socket) => {
 
 
 
-      if (mongoose.Types.ObjectId.isValid(userId)) {
+      if (mongoose.Types.ObjectId.isValid(userId)) {
 
 
 
-        dbUser = await User
+        dbUser = await User
 
 
 
-          .findById(userId)
+          .findById(userId)
 
 
 
-          .select("_id name coins");
+          .select("_id name coins");
 
 
 
-      }
+      }
 
 
 
@@ -4978,19 +5177,19 @@ io.on("connection", (socket) => {
 
 
 
-      if (!dbUser) {
+      if (!dbUser) {
 
 
 
-        socket.emit("realtime_error", {
+        socket.emit("realtime_error", {
 
 
 
-          message: "User database mein nahi mila."
+          message: "User database mein nahi mila."
 
 
 
-        });
+        });
 
 
 
@@ -4998,11 +5197,11 @@ io.on("connection", (socket) => {
 
 
 
-        return;
+        return;
 
 
 
-      }
+      }
 
 
 
@@ -5010,23 +5209,23 @@ io.on("connection", (socket) => {
 
 
 
-      const player = {
+      const player = {
 
 
 
-        socketId: socket.id,
+        socketId: socket.id,
 
 
 
-        userId: normalizeId(dbUser._id),
+        userId: normalizeId(dbUser._id),
 
 
 
-        userName: dbUser.name,
+        userName: dbUser.name,
 
 
 
-        coins: dbUser.coins,
+        coins: dbUser.coins,
 
 
 
@@ -5034,27 +5233,27 @@ io.on("connection", (socket) => {
 
 
 
-        profilePic:
+        profilePic:
 
 
 
-          data.profilePic ||
+          data.profilePic ||
 
 
 
-          data.profileImage ||
+          data.profileImage ||
 
 
 
-          data.avatar ||
+          data.avatar ||
 
 
 
-          ""
+          ""
 
 
 
-      };
+      };
 
 
 
@@ -5062,7 +5261,7 @@ io.on("connection", (socket) => {
 
 
 
-      onlinePlayers.set(socket.id, player);
+      onlinePlayers.set(socket.id, player);
 
 
 
@@ -5070,19 +5269,19 @@ io.on("connection", (socket) => {
 
 
 
-      socketToUser.set(
+      socketToUser.set(
 
 
 
-        socket.id,
+        socket.id,
 
 
 
-        player.userId
+        player.userId
 
 
 
-      );
+      );
 
 
 
@@ -5090,19 +5289,19 @@ io.on("connection", (socket) => {
 
 
 
-      socket.emit("player_registered", {
+      socket.emit("player_registered", {
 
 
 
-        success: true,
+        success: true,
 
 
 
-        player
+        player
 
 
 
-      });
+      });
 
 
 
@@ -5110,35 +5309,35 @@ io.on("connection", (socket) => {
 
 
 
-      console.log(
+      console.log(
 
 
 
-        `🟢 Online: ${player.userName} (${player.userId})`
+        `🟢 Online: ${player.userName} (${player.userId})`
 
 
 
-      );
+      );
 
 
 
-    } catch (err) {
+    } catch (err) {
 
 
 
-      console.error(
+      console.error(
 
 
 
-        "register_player error:",
+        "register_player error:",
 
 
 
-        err
+        err
 
 
 
-      );
+      );
 
 
 
@@ -5146,23 +5345,23 @@ io.on("connection", (socket) => {
 
 
 
-      socket.emit("realtime_error", {
+      socket.emit("realtime_error", {
 
 
 
-        message: "Player register nahi ho saka."
+        message: "Player register nahi ho saka."
 
 
 
-      });
+      });
 
 
 
-    }
+    }
 
 
 
-  });
+  });
 
 
 
@@ -5170,15 +5369,15 @@ io.on("connection", (socket) => {
 
 
 
-  // ====================================================
+  // ====================================================
 
 
 
-  // 2. SEARCH PLAYERS
+  // 2. SEARCH PLAYERS
 
 
 
-  // ====================================================
+  // ====================================================
 
 
 
@@ -5186,35 +5385,35 @@ io.on("connection", (socket) => {
 
 
 
-  socket.on("search_players", async (data = {}) => {
+  socket.on("search_players", async (data = {}) => {
 
 
 
-    try {
+    try {
 
 
 
-      const query = String(
+      const query = String(
 
 
 
-        data.query ||
+        data.query ||
 
 
 
-        data.search ||
+        data.search ||
 
 
 
-        data.userName ||
+        data.userName ||
 
 
 
-        ""
+        ""
 
 
 
-      ).trim();
+      ).trim();
 
 
 
@@ -5222,19 +5421,19 @@ io.on("connection", (socket) => {
 
 
 
-      if (!query) {
+      if (!query) {
 
 
 
-        socket.emit("search_players_result", {
+        socket.emit("search_players_result", {
 
 
 
-          players: []
+          players: []
 
 
 
-        });
+        });
 
 
 
@@ -5242,15 +5441,15 @@ io.on("connection", (socket) => {
 
 
 
-        socket.emit("player_search_results", {
+        socket.emit("player_search_results", {
 
 
 
-          players: []
+          players: []
 
 
 
-        });
+        });
 
 
 
@@ -5258,11 +5457,11 @@ io.on("connection", (socket) => {
 
 
 
-        return;
+        return;
 
 
 
-      }
+      }
 
 
 
@@ -5270,7 +5469,7 @@ io.on("connection", (socket) => {
 
 
 
-      const safeQuery = query.replace(
+      const safeQuery = query.replace(
         /[.*+?^${}()|[\]\\]/g,
         "\\$&"
       );
@@ -5281,39 +5480,39 @@ io.on("connection", (socket) => {
 
 
 
-      const users = await User.find({
+      const users = await User.find({
 
 
 
-        name: {
+        name: {
 
 
 
-          $regex: safeQuery,
+          $regex: safeQuery,
 
 
 
-          $options: "i"
+          $options: "i"
 
 
 
-        }
+        }
 
 
 
-      })
+      })
 
 
 
-        .select("_id name coins")
+        .select("_id name coins")
 
 
 
-        .limit(20)
+        .limit(20)
 
 
 
-        .lean();
+        .lean();
 
 
 
@@ -5321,11 +5520,11 @@ io.on("connection", (socket) => {
 
 
 
-      const requester =
+      const requester =
 
 
 
-        onlinePlayers.get(socket.id);
+        onlinePlayers.get(socket.id);
 
 
 
@@ -5333,23 +5532,23 @@ io.on("connection", (socket) => {
 
 
 
-      const players = users
+      const players = users
 
 
 
-        .filter((user) => {
+        .filter((user) => {
 
 
 
-          if (!requester) {
+          if (!requester) {
 
 
 
-            return true;
+            return true;
 
 
 
-          }
+          }
 
 
 
@@ -5357,23 +5556,23 @@ io.on("connection", (socket) => {
 
 
 
-          return (
+          return (
 
 
 
-            normalizeId(user._id) !==
+            normalizeId(user._id) !==
 
 
 
-            normalizeId(requester.userId)
+            normalizeId(requester.userId)
 
 
 
-          );
+          );
 
 
 
-        })
+        })
 
 
 
@@ -5381,15 +5580,15 @@ io.on("connection", (socket) => {
 
 
 
-        .map((user) => {
+        .map((user) => {
 
 
 
-          const online =
+          const online =
 
 
 
-            getOnlinePlayerByUserId(user._id);
+            getOnlinePlayerByUserId(user._id);
 
 
 
@@ -5397,15 +5596,15 @@ io.on("connection", (socket) => {
 
 
 
-          return {
+          return {
 
 
 
-            id: normalizeId(user._id),
+            id: normalizeId(user._id),
 
 
 
-            userId: normalizeId(user._id),
+            userId: normalizeId(user._id),
 
 
 
@@ -5413,11 +5612,11 @@ io.on("connection", (socket) => {
 
 
 
-            name: user.name,
+            name: user.name,
 
 
 
-            userName: user.name,
+            userName: user.name,
 
 
 
@@ -5425,7 +5624,7 @@ io.on("connection", (socket) => {
 
 
 
-            coins: user.coins,
+            coins: user.coins,
 
 
 
@@ -5433,7 +5632,7 @@ io.on("connection", (socket) => {
 
 
 
-            online: Boolean(online),
+            online: Boolean(online),
 
 
 
@@ -5441,19 +5640,19 @@ io.on("connection", (socket) => {
 
 
 
-            socketId:
+            socketId:
 
 
 
-              online
+              online
 
 
 
-                ? online.socketId
+                ? online.socketId
 
 
 
-                : null,
+                : null,
 
 
 
@@ -5461,27 +5660,27 @@ io.on("connection", (socket) => {
 
 
 
-            profilePic:
+            profilePic:
 
 
 
-              online
+              online
 
 
 
-                ? online.profilePic || ""
+                ? online.profilePic || ""
 
 
 
-                : ""
+                : ""
 
 
 
-          };
+          };
 
 
 
-        });
+        });
 
 
 
@@ -5489,19 +5688,19 @@ io.on("connection", (socket) => {
 
 
 
-      /*
+      /*
 
 
 
-        IMPORTANT FIX:
+        IMPORTANT FIX:
 
 
 
-        Old + new frontend dono event names support.
+        Old + new frontend dono event names support.
 
 
 
-      */
+      */
 
 
 
@@ -5509,19 +5708,19 @@ io.on("connection", (socket) => {
 
 
 
-      socket.emit(
+      socket.emit(
 
 
 
-        "search_players_result",
+        "search_players_result",
 
 
 
-        { players }
+        { players }
 
 
 
-      );
+      );
 
 
 
@@ -5529,39 +5728,39 @@ io.on("connection", (socket) => {
 
 
 
-      socket.emit(
+      socket.emit(
 
 
 
-        "player_search_results",
+        "player_search_results",
 
 
 
-        { players }
+        { players }
 
 
 
-      );
+      );
 
 
 
-    } catch (err) {
+    } catch (err) {
 
 
 
-      console.error(
+      console.error(
 
 
 
-        "search_players error:",
+        "search_players error:",
 
 
 
-        err
+        err
 
 
 
-      );
+      );
 
 
 
@@ -5569,19 +5768,19 @@ io.on("connection", (socket) => {
 
 
 
-      const errorPayload = {
+      const errorPayload = {
 
 
 
-        players: [],
+        players: [],
 
 
 
-        error: "Players search nahi ho sake."
+        error: "Players search nahi ho sake."
 
 
 
-      };
+      };
 
 
 
@@ -5589,19 +5788,19 @@ io.on("connection", (socket) => {
 
 
 
-      socket.emit(
+      socket.emit(
 
 
 
-        "search_players_result",
+        "search_players_result",
 
 
 
-        errorPayload
+        errorPayload
 
 
 
-      );
+      );
 
 
 
@@ -5609,3548 +5808,103 @@ io.on("connection", (socket) => {
 
 
 
-      socket.emit(
+      socket.emit(
 
 
 
-        "player_search_results",
+        "player_search_results",
 
 
 
-        errorPayload
+        errorPayload
 
 
 
-      );
+      );
 
 
 
-    }
+    }
 
 
 
-  });
-
-
-
-
-
-
-
-  // ====================================================
-
-
-
-  // 3. SEND FRIEND REQUEST
-
-
-
-  // ====================================================
-
-
-
-
-
-
-
-  socket.on(
-
-
-
-    "send_friend_request",
-
-
-
-    (data = {}) => {
-
-
-
-      const sender =
-
-
-
-        onlinePlayers.get(socket.id);
-
-
-
-
-
-
-
-      if (!sender) {
-
-
-
-        socket.emit(
-
-
-
-          "friend_request_error",
-
-
-
-          {
-
-
-
-            message:
-
-
-
-              "Pehle realtime player register karein."
-
-
-
-          }
-
-
-
-        );
-
-
-
-
-
-
-
-        return;
-
-
-
-      }
-
-
-
-
-
-
-
-      /*
-
-
-
-        FIX:
-
-
-
-        Frontend toUserId bhej raha tha.
-
-
-
-        Backend targetUserId expect kar raha tha.
-
-
-
-        Ab dono supported.
-
-
-
-      */
-
-
-
-
-
-
-
-      const targetUserId =
-
-
-
-        data.targetUserId ||
-
-
-
-        data.toUserId ||
-
-
-
-        data.receiverId ||
-
-
-
-        data.userId;
-
-
-
-
-
-
-
-      const target =
-
-
-
-        getOnlinePlayerByUserId(
-
-
-
-          targetUserId
-
-
-
-        );
-
-
-
-
-
-
-
-      if (!target) {
-
-
-
-        socket.emit(
-
-
-
-          "friend_request_error",
-
-
-
-          {
-
-
-
-            message:
-
-
-
-              "Yeh player abhi online nahi hai."
-
-
-
-          }
-
-
-
-        );
-
-
-
-
-
-
-
-        return;
-
-
-
-      }
-
-
-
-
-
-
-
-      if (target.socketId === socket.id) {
-
-
-
-        socket.emit(
-
-
-
-          "friend_request_error",
-
-
-
-          {
-
-
-
-            message:
-
-
-
-              "Aap khud ko friend request nahi bhej sakte."
-
-
-
-          }
-
-
-
-        );
-
-
-
-
-
-
-
-        return;
-
-
-
-      }
-
-
-
-
-
-
-
-      io.to(target.socketId).emit(
-
-
-
-        "friend_request_received",
-
-
-
-        {
-
-
-
-          from: {
-
-
-
-            id: sender.userId,
-
-
-
-            userId: sender.userId,
-
-
-
-
-
-
-
-            name: sender.userName,
-
-
-
-            userName: sender.userName,
-
-
-
-
-
-
-
-            profilePic:
-
-
-
-              sender.profilePic || ""
-
-
-
-          }
-
-
-
-        }
-
-
-
-      );
-
-
-
-
-
-
-
-      socket.emit(
-
-
-
-        "friend_request_sent",
-
-
-
-        {
-
-
-
-          success: true,
-
-
-
-
-
-
-
-          targetUserId:
-
-
-
-            target.userId,
-
-
-
-
-
-
-
-          message:
-
-
-
-            `${target.userName} ko friend request bhej di gayi.`
-
-
-
-        }
-
-
-
-      );
-
-
-
-    }
-
-
-
-  );
-
-
-
-
-
-
-
-  // ====================================================
-
-
-
-  // 4. CHALLENGE PLAYER
-
-
-
-  // ====================================================
-
-
-
-
-
-
-
-  socket.on(
-
-
-
-    "challenge_player",
-
-
-
-    (data = {}) => {
-
-
-
-      const sender =
-
-
-
-        onlinePlayers.get(socket.id);
-
-
-
-
-
-
-
-      if (!sender) {
-
-
-
-        socket.emit(
-
-
-
-          "challenge_error",
-
-
-
-          {
-
-
-
-            message:
-
-
-
-              "Pehle realtime player register karein."
-
-
-
-          }
-
-
-
-        );
-
-
-
-
-
-
-
-        return;
-
-
-
-      }
-
-
-
-
-
-
-
-
-
-
-
-
-
-      /*
-
-
-
-        FIX:
-
-
-
-        toUserId bhi accept hoga.
-
-
-
-      */
-
-
-
-
-
-
-
-      const targetUserId =
-
-
-
-        data.targetUserId ||
-
-
-
-        data.toUserId ||
-
-
-
-        data.opponentId ||
-
-
-
-        data.receiverId;
-
-
-
-
-
-
-
-      const target =
-
-
-
-        getOnlinePlayerByUserId(
-
-
-
-          targetUserId
-
-
-
-        );
-
-
-
-
-
-
-
-      if (!target) {
-
-
-
-        socket.emit(
-
-
-
-          "challenge_error",
-
-
-
-          {
-
-
-
-            message:
-
-
-
-              "Opponent abhi online nahi hai."
-
-
-
-          }
-
-
-
-        );
-
-
-
-
-
-
-
-        return;
-
-
-
-      }
-
-
-
-
-
-
-
-      if (target.socketId === socket.id) {
-
-
-
-        socket.emit(
-
-
-
-          "challenge_error",
-
-
-
-          {
-
-
-
-            message:
-
-
-
-              "Aap khud ko challenge nahi kar sakte."
-
-
-
-          }
-
-
-
-        );
-
-
-
-
-
-
-
-        return;
-
-
-
-      }
-
-
-
-
-
-
-
-      const game = String(
-
-
-
-        data.game ||
-
-
-
-        data.gameType ||
-
-
-
-        "ludo"
-
-
-
-      ).toLowerCase();
-
-
-
-
-
-
-
-      const betCoins = Math.max(
-
-
-
-        0,
-
-
-
-        Number(data.betCoins) || 0
-
-
-
-      );
-
-
-
-
-
-
-
-      const challengeId =
-
-
-
-        `challenge_${Date.now()}_${socket.id}_${target.socketId}`;
-
-
-
-
-
-
-
-      /*
-
-
-
-        FIX:
-
-
-
-        Challenge ko backend memory mein save karo.
-
-
-
-        Is se Accept button ko sirf challengeId bhejna
-
-
-
-        pade to bhi backend original challenger,
-
-
-
-        game aur bet identify kar lega.
-
-
-
-      */
-
-
-
-
-
-
-
-      pendingChallenges.set(
-
-
-
-        challengeId,
-
-
-
-        {
-
-
-
-          challengeId,
-
-
-
-
-
-
-
-          challengerUserId:
-
-
-
-            sender.userId,
-
-
-
-
-
-
-
-          targetUserId:
-
-
-
-            target.userId,
-
-
-
-
-
-
-
-          game,
-
-
-
-          betCoins,
-
-
-
-
-
-
-
-          createdAt: Date.now()
-
-
-
-        }
-
-
-
-      );
-
-
-
-
-
-
-
-      // Opponent ko challenge bhejo
-
-
-
-
-
-
-
-      io.to(target.socketId).emit(
-
-
-
-        "challenge_received",
-
-
-
-        {
-
-
-
-          challengeId,
-
-
-
-
-
-
-
-          challengerUserId:
-
-
-
-            sender.userId,
-
-
-
-
-
-
-
-          fromUserId:
-
-
-
-            sender.userId,
-
-
-
-
-
-
-
-          fromName:
-
-
-
-            sender.userName,
-
-
-
-
-
-
-
-          game,
-
-
-
-          betCoins,
-
-
-
-
-
-
-
-          challenger: {
-
-
-
-            id:
-
-
-
-              sender.userId,
-
-
-
-
-
-
-
-            userId:
-
-
-
-              sender.userId,
-
-
-
-
-
-
-
-            name:
-
-
-
-              sender.userName,
-
-
-
-
-
-
-
-            userName:
-
-
-
-              sender.userName,
-
-
-
-
-
-
-
-            socketId:
-
-
-
-              sender.socketId,
-
-
-
-
-
-
-
-            profilePic:
-
-
-
-              sender.profilePic || ""
-
-
-
-          }
-
-
-
-        }
-
-
-
-      );
-
-
-
-
-
-
-
-      // Sender confirmation
-
-
-
-
-
-
-
-      socket.emit(
-
-
-
-        "challenge_sent",
-
-
-
-        {
-
-
-
-          success: true,
-
-
-
-
-
-
-
-          challengeId,
-
-
-
-
-
-
-
-          game,
-
-
-
-          betCoins,
-
-
-
-
-
-
-
-          opponent: {
-
-
-
-            id:
-
-
-
-              target.userId,
-
-
-
-
-
-
-
-            name:
-
-
-
-              target.userName
-
-
-
-          }
-
-
-
-        }
-
-
-
-      );
-
-
-
-
-
-
-
-      console.log(
-
-
-
-        `⚔️ Challenge: ${sender.userName} -> ${target.userName} | ${game} | ${betCoins}`
-
-
-
-      );
-
-
-
-    }
-
-
-
-  );
-
-
-
-
-
-
-
-  // ====================================================
-
-
-
-  // 5. ACCEPT CHALLENGE
-
-
-
-  // ====================================================
-
-
-
-
-
-
-
-  socket.on(
-
-
-
-    "accept_challenge",
-
-
-
-    (data = {}) => {
-
-
-
-      const acceptingPlayer =
-
-
-
-        onlinePlayers.get(socket.id);
-
-
-
-
-
-
-
-      if (!acceptingPlayer) {
-
-
-
-        socket.emit(
-
-
-
-          "challenge_error",
-
-
-
-          {
-
-
-
-            message:
-
-
-
-              "Player realtime system mein registered nahi hai."
-
-
-
-          }
-
-
-
-        );
-
-
-
-
-
-
-
-        return;
-
-
-
-      }
-
-
-
-
-
-
-
-      /*
-
-
-
-        Challenge ID se original challenge retrieve.
-
-
-
-      */
-
-
-
-
-
-
-
-      const savedChallenge =
-
-
-
-        data.challengeId
-
-
-
-          ? pendingChallenges.get(
-
-
-
-              data.challengeId
-
-
-
-            )
-
-
-
-          : null;
-
-
-
-
-
-
-
-      const challengerUserId =
-
-
-
-        data.challengerUserId ||
-
-
-
-        savedChallenge?.challengerUserId ||
-
-
-
-        data.fromUserId ||
-
-
-
-        (
-
-
-
-          data.challenger &&
-
-
-
-          (
-
-
-
-            data.challenger.userId ||
-
-
-
-            data.challenger.id
-
-
-
-          )
-
-
-
-        );
-
-
-
-
-
-
-
-      const challenger =
-
-
-
-        getOnlinePlayerByUserId(
-
-
-
-          challengerUserId
-
-
-
-        );
-
-
-
-
-
-
-
-      if (!challenger) {
-
-
-
-        socket.emit(
-
-
-
-          "challenge_error",
-
-
-
-          {
-
-
-
-            message:
-
-
-
-              "Challenge bhejne wala player offline ho gaya hai."
-
-
-
-          }
-
-
-
-        );
-
-
-
-
-
-
-
-        return;
-
-
-
-      }
-
-
-
-
-
-
-
-      const game = String(
-
-
-
-        data.game ||
-
-
-
-        data.gameType ||
-
-
-
-        savedChallenge?.game ||
-
-
-
-        "ludo"
-
-
-
-      ).toLowerCase();
-
-
-
-
-
-
-
-      const betCoins = Math.max(
-
-
-
-        0,
-
-
-
-        Number(
-
-
-
-          data.betCoins ??
-
-
-
-          savedChallenge?.betCoins
-
-
-
-        ) || 0
-
-
-
-      );
-
-
-
-
-
-
-
-      const roomId =
-
-
-
-        makeRoomId(
-
-
-
-          "challenge_room",
-
-
-
-          challenger.socketId,
-
-
-
-          socket.id
-
-
-
-        );
-
-
-
-
-
-
-
-      const challengerSocket =
-
-
-
-        io.sockets.sockets.get(
-
-
-
-          challenger.socketId
-
-
-
-        );
-
-
-
-
-
-
-
-      if (!challengerSocket) {
-
-
-
-        socket.emit(
-
-
-
-          "challenge_error",
-
-
-
-          {
-
-
-
-            message:
-
-
-
-              "Challenger disconnect ho gaya hai."
-
-
-
-          }
-
-
-
-        );
-
-
-
-
-
-
-
-        return;
-
-
-
-      }
-
-
-
-
-
-
-
-      /*
-
-
-
-        BOTH PLAYERS SAME SOCKET.IO ROOM
-
-
-
-      */
-
-
-
-
-
-
-
-      challengerSocket.join(
-
-
-
-        roomId
-
-
-
-      );
-
-
-
-
-
-
-
-      socket.join(
-
-
-
-        roomId
-
-
-
-      );
-
-
-
-
-
-
-
-      removeFromQueue(
-
-
-
-        challenger.socketId
-
-
-
-      );
-
-
-
-
-
-
-
-      removeFromQueue(
-
-
-
-        socket.id
-
-
-
-      );
-
-
-
-
-
-
-
-      const matchData = {
-
-
-
-        roomId,
-
-
-
-
-
-
-
-        game,
-
-
-
-
-
-
-
-        betCoins,
-
-
-
-
-
-
-
-        matchType:
-
-
-
-          "challenge",
-
-
-
-
-
-
-
-        player1: {
-
-
-
-          id:
-
-
-
-            challenger.userId,
-
-
-
-
-
-
-
-          name:
-
-
-
-            challenger.userName,
-
-
-
-
-
-
-
-          socketId:
-
-
-
-            challenger.socketId,
-
-
-
-
-
-
-
-          profilePic:
-
-
-
-            challenger.profilePic || ""
-
-
-
-        },
-
-
-
-
-
-
-
-        player2: {
-
-
-
-          id:
-
-
-
-            acceptingPlayer.userId,
-
-
-
-
-
-
-
-          name:
-
-
-
-            acceptingPlayer.userName,
-
-
-
-
-
-
-
-          socketId:
-
-
-
-            acceptingPlayer.socketId,
-
-
-
-
-
-
-
-          profilePic:
-
-
-
-            acceptingPlayer.profilePic || ""
-
-
-
-        }
-
-
-
-      };
-
-
-
-
-
-
-
-      /*
-
-
-
-        Dono users ko same match information.
-
-
-
-      */
-
-
-
-
-
-
-
-      const turnState = createServerTurnState(roomId, matchData.player1, matchData.player2);
-      if (turnState) Object.assign(matchData, publicTurnState(turnState));
-
-      io.to(roomId).emit(
-
-
-
-        "challenge_accepted",
-
-
-
-        matchData
-
-
-
-      );
-
-
-
-
-
-
-
-      io.to(roomId).emit(
-
-
-
-        "match_found",
-
-
-
-        matchData
-
-
-
-      );
-
-
-
-
-
-
-
-      if (data.challengeId) {
-
-
-
-        pendingChallenges.delete(
-
-
-
-          data.challengeId
-
-
-
-        );
-
-
-
-      }
-
-
-
-
-
-
-
-      console.log(
-
-
-
-        `⚔️ Challenge accepted: ${challenger.userName} VS ${acceptingPlayer.userName} | ${game} | Room: ${roomId}`
-
-
-
-      );
-
-
-
-    }
-
-
-
-  );
-
-
-
-
-
-
-
-  // ====================================================
-
-
-
-  // 6. REJECT CHALLENGE
-
-
-
-  // ====================================================
-
-
-
-
-
-
-
-  socket.on(
-
-
-
-    "reject_challenge",
-
-
-
-    (data = {}) => {
-
-
-
-      const savedChallenge =
-
-
-
-        data.challengeId
-
-
-
-          ? pendingChallenges.get(
-
-
-
-              data.challengeId
-
-
-
-            )
-
-
-
-          : null;
-
-
-
-
-
-
-
-      const challengerUserId =
-
-
-
-        data.challengerUserId ||
-
-
-
-        savedChallenge?.challengerUserId ||
-
-
-
-        data.fromUserId ||
-
-
-
-        (
-
-
-
-          data.challenger &&
-
-
-
-          (
-
-
-
-            data.challenger.userId ||
-
-
-
-            data.challenger.id
-
-
-
-          )
-
-
-
-        );
-
-
-
-
-
-
-
-      const challenger =
-
-
-
-        getOnlinePlayerByUserId(
-
-
-
-          challengerUserId
-
-
-
-        );
-
-
-
-
-
-
-
-      if (challenger) {
-
-
-
-        io.to(
-
-
-
-          challenger.socketId
-
-
-
-        ).emit(
-
-
-
-          "challenge_rejected",
-
-
-
-          {
-
-
-
-            message:
-
-
-
-              "Opponent ne challenge decline kar diya."
-
-
-
-          }
-
-
-
-        );
-
-
-
-      }
-
-
-
-
-
-
-
-      if (data.challengeId) {
-
-
-
-        pendingChallenges.delete(
-
-
-
-          data.challengeId
-
-
-
-        );
-
-
-
-      }
-
-
-
-
-
-
-
-      socket.emit(
-
-
-
-        "challenge_rejected_confirmation",
-
-
-
-        {
-
-
-
-          success: true
-
-
-
-        }
-
-
-
-      );
-
-
-
-    }
-
-
-
-  );
-
-
-
-
-
-
-
-  // ====================================================
-
-
-
-  // 7. RANDOM MATCHMAKING
-
-
-
-  // ====================================================
-
-
-
-
-
-
-
-  socket.on(
-
-
-
-    "find_random_match",
-
-
-
-    (data = {}) => {
-
-
-
-      const registeredPlayer =
-
-
-
-        onlinePlayers.get(
-
-
-
-          socket.id
-
-
-
-        );
-
-
-
-
-
-
-
-      const userId =
-
-
-
-        normalizeId(
-
-
-
-          data.userId ||
-
-
-
-          (
-
-
-
-            registeredPlayer &&
-
-
-
-            registeredPlayer.userId
-
-
-
-          )
-
-
-
-        );
-
-
-
-
-
-
-
-      const userName =
-
-
-
-        data.userName ||
-
-
-
-        data.name ||
-
-
-
-        (
-
-
-
-          registeredPlayer &&
-
-
-
-          registeredPlayer.userName
-
-
-
-        );
-
-
-
-
-
-
-
-      const game =
-
-
-
-        String(
-
-
-
-          data.game ||
-
-
-
-          data.gameType ||
-
-
-
-          "ludo"
-
-
-
-        ).toLowerCase();
-
-
-
-
-
-
-
-      const betCoins =
-
-
-
-        Math.max(
-
-
-
-          0,
-
-
-
-          Number(
-
-
-
-            data.betCoins
-
-
-
-          ) || 0
-
-
-
-        );
-
-
-
-
-
-
-
-      if (
-
-
-
-        !userId ||
-
-
-
-        !userName
-
-
-
-      ) {
-
-
-
-        socket.emit(
-
-
-
-          "match_error",
-
-
-
-          {
-
-
-
-            message:
-
-
-
-              "User information missing hai."
-
-
-
-          }
-
-
-
-        );
-
-
-
-
-
-
-
-        return;
-
-
-
-      }
-
-
-
-
-
-
-
-      /*
-
-
-
-        Safety:
-
-
-
-        stale entry remove kar dete hain agar same
-
-
-
-        socket kisi purani queue state mein reh gaya ho.
-
-
-
-      */
-
-
-
-
-
-
-
-      waitingQueue =
-
-
-
-        waitingQueue.filter(
-
-
-
-          (player) => {
-
-
-
-            if (
-
-
-
-              player.socketId ===
-
-
-
-              socket.id
-
-
-
-            ) {
-
-
-
-              return false;
-
-
-
-            }
-
-
-
-
-
-
-
-            const oldSocket =
-
-
-
-              io.sockets.sockets.get(
-
-
-
-                player.socketId
-
-
-
-              );
-
-
-
-
-
-
-
-            return Boolean(oldSocket);
-
-
-
-          }
-
-
-
-        );
-
-
-
-
-
-
-
-      console.log(
-
-
-
-        `🔍 ${userName} | ${game} | ${betCoins} coins matchmaking queue mein aa gaya hai.`
-
-
-
-      );
-
-
-
-
-
-
-
-      // ----------------------------------------
-
-
-
-      // SAME GAME + SAME BET OPPONENT
-
-
-
-      // ----------------------------------------
-
-
-
-
-
-
-
-      const existingIndex =
-
-
-
-        waitingQueue.findIndex(
-
-
-
-          (player) =>
-
-
-
-            player.socketId !==
-
-
-
-              socket.id &&
-
-
-
-
-
-
-
-            normalizeId(
-
-
-
-              player.userId
-
-
-
-            ) !== userId &&
-
-
-
-
-
-
-
-            Number(
-
-
-
-              player.betCoins
-
-
-
-            ) === Number(
-
-
-
-              betCoins
-
-
-
-            ) &&
-
-
-
-
-
-
-
-            String(
-
-
-
-              player.game
-
-
-
-            ).toLowerCase() ===
-
-
-
-              game &&
-
-
-
-
-
-
-
-            io.sockets.sockets.has(
-
-
-
-              player.socketId
-
-
-
-            )
-
-
-
-        );
-
-
-
-
-
-
-
-      // ========================================
-
-
-
-      // MATCH FOUND
-
-
-
-      // ========================================
-
-
-
-
-
-
-
-      if (
-
-
-
-        existingIndex !== -1
-
-
-
-      ) {
-
-
-
-        const opponent =
-
-
-
-          waitingQueue.splice(
-
-
-
-            existingIndex,
-
-
-
-            1
-
-
-
-          )[0];
-
-
-
-
-
-
-
-        const opponentSocket =
-
-
-
-          io.sockets.sockets.get(
-
-
-
-            opponent.socketId
-
-
-
-          );
-
-
-
-
-
-
-
-        if (!opponentSocket) {
-
-
-
-          /*
-
-
-
-            Opponent stale nikla.
-
-
-
-            Current user ko queue mein daal do.
-
-
-
-          */
-
-
-
-
-
-
-
-          waitingQueue.push({
-
-
-
-            socketId:
-
-
-
-              socket.id,
-
-
-
-
-
-
-
-            userId,
-
-
-
-
-
-
-
-            userName,
-
-
-
-
-
-
-
-            game,
-
-
-
-
-
-
-
-            betCoins
-
-
-
-          });
-
-
-
-
-
-
-
-          socket.emit(
-
-
-
-            "waiting_for_opponent",
-
-
-
-            {
-
-
-
-              message:
-
-
-
-                "Opponent disconnect ho gaya. Naya opponent search ho raha hai...",
-
-
-
-
-
-
-
-              game,
-
-
-
-              betCoins
-
-
-
-            }
-
-
-
-          );
-
-
-
-
-
-
-
-          return;
-
-
-
-        }
-
-
-
-
-
-
-
-        const roomId =
-
-
-
-          makeRoomId(
-
-
-
-            "room",
-
-
-
-            socket.id,
-
-
-
-            opponent.socketId
-
-
-
-          );
-
-
-
-
-
-
-
-        /*
-
-
-
-          Both players join SAME ROOM.
-
-
-
-        */
-
-
-
-
-
-
-
-        socket.join(
-
-
-
-          roomId
-
-
-
-        );
-
-
-
-
-
-
-
-        opponentSocket.join(
-
-
-
-          roomId
-
-
-
-        );
-
-
-
-
-
-
-
-        /*
-
-
-
-          Ensure current player queue mein
-
-
-
-          duplicate na rahe.
-
-
-
-        */
-
-
-
-
-
-
-
-        removeFromQueue(
-
-
-
-          socket.id
-
-
-
-        );
-
-
-
-
-
-
-
-        const currentProfile =
-
-
-
-          onlinePlayers.get(
-
-
-
-            socket.id
-
-
-
-          );
-
-
-
-
-
-
-
-        const opponentProfile =
-
-
-
-          onlinePlayers.get(
-
-
-
-            opponent.socketId
-
-
-
-          );
-
-
-
-
-
-
-
-        const matchData = {
-
-
-
-          roomId,
-
-
-
-
-
-
-
-          game,
-
-
-
-
-
-
-
-          betCoins,
-
-
-
-
-
-
-
-          matchType:
-
-
-
-            "random",
-
-
-
-
-
-
-
-          player1: {
-
-
-
-            id:
-
-
-
-              userId,
-
-
-
-
-
-
-
-            userId,
-
-
-
-
-
-
-
-            name:
-
-
-
-              userName,
-
-
-
-
-
-
-
-            userName,
-
-
-
-
-
-
-
-            socketId:
-
-
-
-              socket.id,
-
-
-
-
-
-
-
-            profilePic:
-
-
-
-              (
-
-
-
-                currentProfile &&
-
-
-
-                currentProfile.profilePic
-
-
-
-              ) || ""
-
-
-
-          },
-
-
-
-
-
-
-
-          player2: {
-
-
-
-            id:
-
-
-
-              opponent.userId,
-
-
-
-
-
-
-
-            userId:
-
-
-
-              opponent.userId,
-
-
-
-
-
-
-
-            name:
-
-
-
-              opponent.userName,
-
-
-
-
-
-
-
-            userName:
-
-
-
-              opponent.userName,
-
-
-
-
-
-
-
-            socketId:
-
-
-
-              opponent.socketId,
-
-
-
-
-
-
-
-            profilePic:
-
-
-
-              (
-
-
-
-                opponentProfile &&
-
-
-
-                opponentProfile.profilePic
-
-
-
-              ) || ""
-
-
-
-          }
-
-
-
-        };
-
-
-
-
-
-
-
-        /*
-
-
-
-          MOST IMPORTANT:
-
-
-
-          SAME match_found event dono browsers ko.
-
-
-
-        */
-
-
-
-
-
-
-
-        const turnState = createServerTurnState(roomId, matchData.player1, matchData.player2);
-        if (turnState) Object.assign(matchData, publicTurnState(turnState));
-
-        io.to(
-
-
-
-          roomId
-
-
-
-        ).emit(
-
-
-
-          "match_found",
-
-
-
-          matchData
-
-
-
-        );
-
-
-
-
-
-
-
-        console.log(
-
-
-
-          `🎮 Match Start! ${game} | Room: ${roomId} | ${userName} VS ${opponent.userName} | Bet: ${betCoins}`
-
-
-
-        );
-
-
-
-
-
-
-
-        return;
-
-
-
-      }
-
-
-
-
-
-
-
-      // ========================================
-
-
-
-      // NO MATCH - WAIT
-
-
-
-      // ========================================
-
-
-
-
-
-
-
-      waitingQueue.push({
-
-
-
-        socketId:
-
-
-
-          socket.id,
-
-
-
-
-
-
-
-        userId,
-
-
-
-
-
-
-
-        userName,
-
-
-
-
-
-
-
-        game,
-
-
-
-
-
-
-
-        betCoins
-
-
-
-      });
-
-
-
-
-
-
-
-      socket.emit(
-
-
-
-        "waiting_for_opponent",
-
-
-
-        {
-
-
-
-          message:
-
-
-
-            "Opponent ki talash ki ja rahi hai...",
-
-
-
-
-
-
-
-          game,
-
-
-
-
-
-
-
-          betCoins
-
-
-
-        }
-
-
-
-      );
-
-
-
-
-
-
-
-      console.log(
-
-
-
-        `⏳ ${userName} ${game} ke liye queue mein wait kar raha hai.`
-
-
-
-      );
-
-
-
-    }
-
-
-
-  );
-
-
-
-
-
-
-
-  // ====================================================
-
-
-
-  // 8. CANCEL RANDOM MATCH
-
-
-
-  // ====================================================
-
-
-
-
-
-
-
-  socket.on(
-
-
-
-    "cancel_queue",
-
-
-
-    () => {
-
-
-
-      removeFromQueue(
-
-
-
-        socket.id
-
-
-
-      );
-
-
-
-
-
-
-
-      socket.emit(
-
-
-
-        "queue_cancelled",
-
-
-
-        {
-
-
-
-          message:
-
-
-
-            "Matchmaking cancel kar di gayi."
-
-
-
-        }
-
-
-
-      );
-
-
-
-
-
-
-
-      console.log(
-
-
-
-        `🚫 Matchmaking cancelled: ${socket.id}`
-
-
-
-      );
-
-
-
-    }
-
-
-
-  );
-
-
-
-
-
-
-
-  // ====================================================
-
-
-
-  // 8B. SERVER-AUTHORITATIVE TURN/TIMER EVENTS
-  socket.on("request_turn_state", ({ roomId } = {}) => {
-    if (!roomId || !socket.rooms.has(roomId)) return;
-    const state = gameRooms.get(roomId);
-    if (state) socket.emit("turn_state", { ...publicTurnState(state), reason: "sync" });
   });
 
-  socket.on("end_turn", ({ roomId, turnNumber } = {}) => {
-    if (!roomId || !socket.rooms.has(roomId)) return;
-    const state = gameRooms.get(roomId);
-    if (!state) return;
 
-    const current = state.players[state.currentTurnIndex];
-    if (current?.socketId !== socket.id) {
-      socket.emit("realtime_error", { message: "Abhi aapki turn nahi hai." });
-      return;
-    }
-    if (Number(turnNumber) !== state.turnNumber) {
-      socket.emit("turn_state", { ...publicTurnState(state), reason: "stale_turn_rejected" });
-      return;
-    }
-    advanceServerTurn(roomId, "player_finished");
-  });
+
+
+
+
 
   // ====================================================
-  // 9. GAME ROOM EVENTS
 
 
 
-  // ====================================================
+  // 3. SEND FRIEND REQUEST
 
 
 
+  // ====================================================
 
 
 
 
-  socket.on(
 
 
 
-    "game_event",
+  socket.on(
 
 
 
-    (data = {}) => {
+    "send_friend_request",
 
 
 
-      const {
+    (data = {}) => {
 
 
 
-        roomId,
+      const sender =
 
 
 
-        type,
+        onlinePlayers.get(socket.id);
 
 
 
-        payload
 
 
 
-      } = data;
 
+      if (!sender) {
 
 
 
+        socket.emit(
 
 
 
-      if (
+          "friend_request_error",
 
 
 
-        !roomId ||
+          {
 
 
 
-        !type
+            message:
 
 
 
-      ) {
+              "Pehle realtime player register karein."
 
 
 
-        return;
+          }
 
 
 
-      }
+        );
 
 
 
@@ -9158,401 +5912,10 @@ io.on("connection", (socket) => {
 
 
 
-      /*
+        return;
 
 
 
-        Security:
-
-
-
-        sender us room ka member hona chahiye.
-
-
-
-      */
-
-
-
-
-
-
-
-      if (
-
-
-
-        !socket.rooms.has(
-
-
-
-          roomId
-
-
-
-        )
-
-
-
-      ) {
-
-
-
-        socket.emit(
-
-
-
-          "realtime_error",
-
-
-
-          {
-
-
-
-            message:
-
-
-
-              "Aap is game room ka hissa nahi hain."
-
-
-
-          }
-
-
-
-        );
-
-
-
-
-
-
-
-        return;
-
-
-
-      }
-
-
-
-
-
-
-
-      /*
-
-
-
-        Sender ke ilawa room ke opponent
-
-
-
-        ko game action bhejo.
-
-
-
-      */
-
-
-
-
-
-
-
-      socket
-
-
-
-        .to(roomId)
-
-
-
-        .emit(
-
-
-
-          "game_event",
-
-
-
-          {
-
-
-
-            roomId,
-
-
-
-
-
-
-
-            type,
-
-
-
-
-
-
-
-            payload,
-
-
-
-
-
-
-
-            fromSocketId:
-
-
-
-              socket.id
-
-
-
-          }
-
-
-
-        );
-
-
-
-    }
-
-
-
-  );
-
-
-
-
-
-
-
-  // ====================================================
-
-
-
-  // 10. LEAVE GAME ROOM
-
-
-
-  // ====================================================
-
-
-
-
-
-
-
-  socket.on(
-
-
-
-    "leave_game_room",
-
-
-
-    (data = {}) => {
-
-
-
-      const roomId =
-
-
-
-        data.roomId;
-
-
-
-
-
-
-
-      if (
-
-
-
-        !roomId ||
-
-
-
-        !socket.rooms.has(
-
-
-
-          roomId
-
-
-
-        )
-
-
-
-      ) {
-
-
-
-        return;
-
-
-
-      }
-
-
-
-
-
-
-
-      socket
-
-
-
-        .to(roomId)
-
-
-
-        .emit(
-
-
-
-          "opponent_left_game",
-
-
-
-          {
-
-
-
-            socketId:
-
-
-
-              socket.id,
-
-
-
-
-
-
-
-            message:
-
-
-
-              "Opponent game se nikal gaya."
-
-
-
-          }
-
-
-
-        );
-
-
-
-
-
-
-
-      socket.leave(
-
-
-
-        roomId
-
-
-
-      );
-
-
-
-    }
-
-
-
-  );
-
-
-
-
-
-
-
-  // ====================================================
-
-
-
-  // 11. DISCONNECT
-
-
-
-  // ====================================================
-
-
-
-
-
-
-
-  socket.on(
-
-
-
-    "disconnect",
-
-
-
-    () => {
-
-
-
-      console.log(
-
-
-
-        "❌ User disconnect ho gaya:",
-
-
-
-        socket.id
-
-
-
-      );
-
-
-
-
-
-
-
-      // Matchmaking queue clean
-
-
-
-      removeFromQueue(
-
-
-
-        socket.id
-
-
-
-      );
-
-      for (const [roomId, state] of gameRooms.entries()) {
-        if (state.players.some((p) => p.socketId === socket.id)) {
-          socket.to(roomId).emit("opponent_disconnected", { socketId: socket.id });
-          destroyServerTurnState(roomId);
-        }
       }
 
 
@@ -9561,223 +5924,4021 @@ io.on("connection", (socket) => {
 
 
 
-      const userId =
+      /*
 
 
 
-        socketToUser.get(
+        FIX:
 
 
 
-          socket.id
+        Frontend toUserId bhej raha tha.
 
 
 
-        );
+        Backend targetUserId expect kar raha tha.
 
 
 
+        Ab dono supported.
 
 
 
+      */
 
-      // Online players clean
 
 
 
-      onlinePlayers.delete(
 
 
 
-        socket.id
+      const targetUserId =
 
 
 
-      );
+        data.targetUserId ||
 
 
 
+        data.toUserId ||
 
 
 
+        data.receiverId ||
 
-      socketToUser.delete(
 
 
+        data.userId;
 
-        socket.id
 
 
 
-      );
 
 
 
+      const target =
 
 
 
+        getOnlinePlayerByUserId(
 
-      /*
 
 
+          targetUserId
 
-        Is disconnected player ke pending
 
 
+        );
 
-        challenges bhi clean kar do.
 
 
 
-      */
 
 
 
+      if (!target) {
 
 
 
+        socket.emit(
 
-      for (
 
 
+          "friend_request_error",
 
-        const [
 
 
+          {
 
-          challengeId,
 
 
+            message:
 
-          challenge
 
 
+              "Yeh player abhi online nahi hai."
 
-        ] of pendingChallenges
 
 
+          }
 
-      ) {
 
 
+        );
 
-        if (
 
 
 
-          normalizeId(
 
 
 
-            challenge.challengerUserId
+        return;
 
 
 
-          ) === normalizeId(
+      }
 
 
 
-            userId
 
 
 
-          ) ||
 
+      if (target.socketId === socket.id) {
 
 
-          normalizeId(
 
+        socket.emit(
 
 
-            challenge.targetUserId
 
+          "friend_request_error",
 
 
-          ) === normalizeId(
 
+          {
 
 
-            userId
 
+            message:
 
 
-          )
 
+              "Aap khud ko friend request nahi bhej sakte."
 
 
-        ) {
 
+          }
 
 
-          pendingChallenges.delete(
 
+        );
 
 
-            challengeId
 
 
 
-          );
 
 
+        return;
 
-        }
 
 
+      }
 
-      }
 
 
 
 
 
 
+      io.to(target.socketId).emit(
 
-      socket.broadcast.emit(
 
 
+        "friend_request_received",
 
-        "player_offline",
 
 
+        {
 
-        {
 
 
+          from: {
 
-          userId:
 
 
+            id: sender.userId,
 
-            userId || null,
 
 
+            userId: sender.userId,
 
 
 
 
 
-          socketId:
 
 
+            name: sender.userName,
 
-            socket.id
 
 
+            userName: sender.userName,
 
-        }
 
 
 
-      );
 
 
 
-    }
+            profilePic:
 
 
 
-  );
+              sender.profilePic || ""
+
+
+
+          }
+
+
+
+        }
+
+
+
+      );
+
+
+
+
+
+
+
+      socket.emit(
+
+
+
+        "friend_request_sent",
+
+
+
+        {
+
+
+
+          success: true,
+
+
+
+
+
+
+
+          targetUserId:
+
+
+
+            target.userId,
+
+
+
+
+
+
+
+          message:
+
+
+
+            `${target.userName} ko friend request bhej di gayi.`
+
+
+
+        }
+
+
+
+      );
+
+
+
+    }
+
+
+
+  );
+
+
+
+
+
+
+
+  // ====================================================
+
+
+
+  // 4. CHALLENGE PLAYER
+
+
+
+  // ====================================================
+
+
+
+
+
+
+
+  socket.on(
+
+
+
+    "challenge_player",
+
+
+
+    (data = {}) => {
+
+
+
+      const sender =
+
+
+
+        onlinePlayers.get(socket.id);
+
+
+
+
+
+
+
+      if (!sender) {
+
+
+
+        socket.emit(
+
+
+
+          "challenge_error",
+
+
+
+          {
+
+
+
+            message:
+
+
+
+              "Pehle realtime player register karein."
+
+
+
+          }
+
+
+
+        );
+
+
+
+
+
+
+
+        return;
+
+
+
+      }
+
+
+
+
+
+
+
+
+
+
+
+
+
+      /*
+
+
+
+        FIX:
+
+
+
+        toUserId bhi accept hoga.
+
+
+
+      */
+
+
+
+
+
+
+
+      const targetUserId =
+
+
+
+        data.targetUserId ||
+
+
+
+        data.toUserId ||
+
+
+
+        data.opponentId ||
+
+
+
+        data.receiverId;
+
+
+
+
+
+
+
+      const target =
+
+
+
+        getOnlinePlayerByUserId(
+
+
+
+          targetUserId
+
+
+
+        );
+
+
+
+
+
+
+
+      if (!target) {
+
+
+
+        socket.emit(
+
+
+
+          "challenge_error",
+
+
+
+          {
+
+
+
+            message:
+
+
+
+              "Opponent abhi online nahi hai."
+
+
+
+          }
+
+
+
+        );
+
+
+
+
+
+
+
+        return;
+
+
+
+      }
+
+
+
+
+
+
+
+      if (target.socketId === socket.id) {
+
+
+
+        socket.emit(
+
+
+
+          "challenge_error",
+
+
+
+          {
+
+
+
+            message:
+
+
+
+              "Aap khud ko challenge nahi kar sakte."
+
+
+
+          }
+
+
+
+        );
+
+
+
+
+
+
+
+        return;
+
+
+
+      }
+
+
+
+
+
+
+
+      const game = String(
+
+
+
+        data.game ||
+
+
+
+        data.gameType ||
+
+
+
+        "ludo"
+
+
+
+      ).toLowerCase();
+
+
+
+
+
+
+
+      const betCoins = Math.max(
+
+
+
+        0,
+
+
+
+        Number(data.betCoins) || 0
+
+
+
+      );
+
+
+
+
+
+
+
+      const challengeId =
+
+
+
+        `challenge_${Date.now()}_${socket.id}_${target.socketId}`;
+
+
+
+
+
+
+
+      /*
+
+
+
+        FIX:
+
+
+
+        Challenge ko backend memory mein save karo.
+
+
+
+        Is se Accept button ko sirf challengeId bhejna
+
+
+
+        pade to bhi backend original challenger,
+
+
+
+        game aur bet identify kar lega.
+
+
+
+      */
+
+
+
+
+
+
+
+      pendingChallenges.set(
+
+
+
+        challengeId,
+
+
+
+        {
+
+
+
+          challengeId,
+
+
+
+
+
+
+
+          challengerUserId:
+
+
+
+            sender.userId,
+
+
+
+
+
+
+
+          targetUserId:
+
+
+
+            target.userId,
+
+
+
+
+
+
+
+          game,
+
+
+
+          betCoins,
+
+
+
+
+
+
+
+          createdAt: Date.now()
+
+
+
+        }
+
+
+
+      );
+
+
+
+
+
+
+
+      // Opponent ko challenge bhejo
+
+
+
+
+
+
+
+      io.to(target.socketId).emit(
+
+
+
+        "challenge_received",
+
+
+
+        {
+
+
+
+          challengeId,
+
+
+
+
+
+
+
+          challengerUserId:
+
+
+
+            sender.userId,
+
+
+
+
+
+
+
+          fromUserId:
+
+
+
+            sender.userId,
+
+
+
+
+
+
+
+          fromName:
+
+
+
+            sender.userName,
+
+
+
+
+
+
+
+          game,
+
+
+
+          betCoins,
+
+
+
+
+
+
+
+          challenger: {
+
+
+
+            id:
+
+
+
+              sender.userId,
+
+
+
+
+
+
+
+            userId:
+
+
+
+              sender.userId,
+
+
+
+
+
+
+
+            name:
+
+
+
+              sender.userName,
+
+
+
+
+
+
+
+            userName:
+
+
+
+              sender.userName,
+
+
+
+
+
+
+
+            socketId:
+
+
+
+              sender.socketId,
+
+
+
+
+
+
+
+            profilePic:
+
+
+
+              sender.profilePic || ""
+
+
+
+          }
+
+
+
+        }
+
+
+
+      );
+
+
+
+
+
+
+
+      // Sender confirmation
+
+
+
+
+
+
+
+      socket.emit(
+
+
+
+        "challenge_sent",
+
+
+
+        {
+
+
+
+          success: true,
+
+
+
+
+
+
+
+          challengeId,
+
+
+
+
+
+
+
+          game,
+
+
+
+          betCoins,
+
+
+
+
+
+
+
+          opponent: {
+
+
+
+            id:
+
+
+
+              target.userId,
+
+
+
+
+
+
+
+            name:
+
+
+
+              target.userName
+
+
+
+          }
+
+
+
+        }
+
+
+
+      );
+
+
+
+
+
+
+
+      console.log(
+
+
+
+        `⚔️ Challenge: ${sender.userName} -> ${target.userName} | ${game} | ${betCoins}`
+
+
+
+      );
+
+
+
+    }
+
+
+
+  );
+
+
+
+
+
+
+
+  // ====================================================
+
+
+
+  // 5. ACCEPT CHALLENGE
+
+
+
+  // ====================================================
+
+
+
+
+
+
+
+  socket.on(
+
+
+
+    "accept_challenge",
+
+
+
+    (data = {}) => {
+
+
+
+      const acceptingPlayer =
+
+
+
+        onlinePlayers.get(socket.id);
+
+
+
+
+
+
+
+      if (!acceptingPlayer) {
+
+
+
+        socket.emit(
+
+
+
+          "challenge_error",
+
+
+
+          {
+
+
+
+            message:
+
+
+
+              "Player realtime system mein registered nahi hai."
+
+
+
+          }
+
+
+
+        );
+
+
+
+
+
+
+
+        return;
+
+
+
+      }
+
+
+
+
+
+
+
+      /*
+
+
+
+        Challenge ID se original challenge retrieve.
+
+
+
+      */
+
+
+
+
+
+
+
+      const savedChallenge =
+
+
+
+        data.challengeId
+
+
+
+          ? pendingChallenges.get(
+
+
+
+              data.challengeId
+
+
+
+            )
+
+
+
+          : null;
+
+
+
+
+
+
+
+      const challengerUserId =
+
+
+
+        data.challengerUserId ||
+
+
+
+        savedChallenge?.challengerUserId ||
+
+
+
+        data.fromUserId ||
+
+
+
+        (
+
+
+
+          data.challenger &&
+
+
+
+          (
+
+
+
+            data.challenger.userId ||
+
+
+
+            data.challenger.id
+
+
+
+          )
+
+
+
+        );
+
+
+
+
+
+
+
+      const challenger =
+
+
+
+        getOnlinePlayerByUserId(
+
+
+
+          challengerUserId
+
+
+
+        );
+
+
+
+
+
+
+
+      if (!challenger) {
+
+
+
+        socket.emit(
+
+
+
+          "challenge_error",
+
+
+
+          {
+
+
+
+            message:
+
+
+
+              "Challenge bhejne wala player offline ho gaya hai."
+
+
+
+          }
+
+
+
+        );
+
+
+
+
+
+
+
+        return;
+
+
+
+      }
+
+
+
+
+
+
+
+      const game = String(
+
+
+
+        data.game ||
+
+
+
+        data.gameType ||
+
+
+
+        savedChallenge?.game ||
+
+
+
+        "ludo"
+
+
+
+      ).toLowerCase();
+
+
+
+
+
+
+
+      const betCoins = Math.max(
+
+
+
+        0,
+
+
+
+        Number(
+
+
+
+          data.betCoins ??
+
+
+
+          savedChallenge?.betCoins
+
+
+
+        ) || 0
+
+
+
+      );
+
+
+
+
+
+
+
+      const roomId =
+
+
+
+        makeRoomId(
+
+
+
+          "challenge_room",
+
+
+
+          challenger.socketId,
+
+
+
+          socket.id
+
+
+
+        );
+
+
+
+
+
+
+
+      const challengerSocket =
+
+
+
+        io.sockets.sockets.get(
+
+
+
+          challenger.socketId
+
+
+
+        );
+
+
+
+
+
+
+
+      if (!challengerSocket) {
+
+
+
+        socket.emit(
+
+
+
+          "challenge_error",
+
+
+
+          {
+
+
+
+            message:
+
+
+
+              "Challenger disconnect ho gaya hai."
+
+
+
+          }
+
+
+
+        );
+
+
+
+
+
+
+
+        return;
+
+
+
+      }
+
+
+
+
+
+
+
+      /*
+
+
+
+        BOTH PLAYERS SAME SOCKET.IO ROOM
+
+
+
+      */
+
+
+
+
+
+
+
+      challengerSocket.join(
+
+
+
+        roomId
+
+
+
+      );
+
+
+
+
+
+
+
+      socket.join(
+
+
+
+        roomId
+
+
+
+      );
+
+
+
+
+
+
+
+      removeFromQueue(
+
+
+
+        challenger.socketId
+
+
+
+      );
+
+
+
+
+
+
+
+      removeFromQueue(
+
+
+
+        socket.id
+
+
+
+      );
+
+
+
+
+
+
+
+      const matchData = {
+
+
+
+        roomId,
+
+
+
+
+
+
+
+        game,
+
+
+
+
+
+
+
+        betCoins,
+
+
+
+
+
+
+
+        matchType:
+
+
+
+          "challenge",
+
+
+
+
+
+
+
+        player1: {
+
+
+
+          id:
+
+
+
+            challenger.userId,
+
+
+
+
+
+
+
+          name:
+
+
+
+            challenger.userName,
+
+
+
+
+
+
+
+          socketId:
+
+
+
+            challenger.socketId,
+
+
+
+
+
+
+
+          profilePic:
+
+
+
+            challenger.profilePic || ""
+
+
+
+        },
+
+
+
+
+
+
+
+        player2: {
+
+
+
+          id:
+
+
+
+            acceptingPlayer.userId,
+
+
+
+
+
+
+
+          name:
+
+
+
+            acceptingPlayer.userName,
+
+
+
+
+
+
+
+          socketId:
+
+
+
+            acceptingPlayer.socketId,
+
+
+
+
+
+
+
+          profilePic:
+
+
+
+            acceptingPlayer.profilePic || ""
+
+
+
+        }
+
+
+
+      };
+
+
+
+
+
+
+
+      /*
+
+
+
+        Dono users ko same match information.
+
+
+
+      */
+
+
+
+
+
+
+
+      io.to(roomId).emit(
+
+
+
+        "challenge_accepted",
+
+
+
+        matchData
+
+
+
+      );
+
+
+
+
+
+
+
+      io.to(roomId).emit(
+
+
+
+        "match_found",
+
+
+
+        matchData
+
+
+
+      );
+
+
+
+
+
+
+
+      if (data.challengeId) {
+
+
+
+        pendingChallenges.delete(
+
+
+
+          data.challengeId
+
+
+
+        );
+
+
+
+      }
+
+
+
+
+
+
+
+      console.log(
+
+
+
+        `⚔️ Challenge accepted: ${challenger.userName} VS ${acceptingPlayer.userName} | ${game} | Room: ${roomId}`
+
+
+
+      );
+
+
+
+    }
+
+
+
+  );
+
+
+
+
+
+
+
+  // ====================================================
+
+
+
+  // 6. REJECT CHALLENGE
+
+
+
+  // ====================================================
+
+
+
+
+
+
+
+  socket.on(
+
+
+
+    "reject_challenge",
+
+
+
+    (data = {}) => {
+
+
+
+      const savedChallenge =
+
+
+
+        data.challengeId
+
+
+
+          ? pendingChallenges.get(
+
+
+
+              data.challengeId
+
+
+
+            )
+
+
+
+          : null;
+
+
+
+
+
+
+
+      const challengerUserId =
+
+
+
+        data.challengerUserId ||
+
+
+
+        savedChallenge?.challengerUserId ||
+
+
+
+        data.fromUserId ||
+
+
+
+        (
+
+
+
+          data.challenger &&
+
+
+
+          (
+
+
+
+            data.challenger.userId ||
+
+
+
+            data.challenger.id
+
+
+
+          )
+
+
+
+        );
+
+
+
+
+
+
+
+      const challenger =
+
+
+
+        getOnlinePlayerByUserId(
+
+
+
+          challengerUserId
+
+
+
+        );
+
+
+
+
+
+
+
+      if (challenger) {
+
+
+
+        io.to(
+
+
+
+          challenger.socketId
+
+
+
+        ).emit(
+
+
+
+          "challenge_rejected",
+
+
+
+          {
+
+
+
+            message:
+
+
+
+              "Opponent ne challenge decline kar diya."
+
+
+
+          }
+
+
+
+        );
+
+
+
+      }
+
+
+
+
+
+
+
+      if (data.challengeId) {
+
+
+
+        pendingChallenges.delete(
+
+
+
+          data.challengeId
+
+
+
+        );
+
+
+
+      }
+
+
+
+
+
+
+
+      socket.emit(
+
+
+
+        "challenge_rejected_confirmation",
+
+
+
+        {
+
+
+
+          success: true
+
+
+
+        }
+
+
+
+      );
+
+
+
+    }
+
+
+
+  );
+
+
+
+
+
+
+
+  // ====================================================
+
+
+
+  // 7. RANDOM MATCHMAKING
+
+
+
+  // ====================================================
+
+
+
+
+
+
+
+  socket.on(
+
+
+
+    "find_random_match",
+
+
+
+    (data = {}) => {
+
+
+
+      const registeredPlayer =
+
+
+
+        onlinePlayers.get(
+
+
+
+          socket.id
+
+
+
+        );
+
+
+
+
+
+
+
+      const userId =
+
+
+
+        normalizeId(
+
+
+
+          data.userId ||
+
+
+
+          (
+
+
+
+            registeredPlayer &&
+
+
+
+            registeredPlayer.userId
+
+
+
+          )
+
+
+
+        );
+
+
+
+
+
+
+
+      const userName =
+
+
+
+        data.userName ||
+
+
+
+        data.name ||
+
+
+
+        (
+
+
+
+          registeredPlayer &&
+
+
+
+          registeredPlayer.userName
+
+
+
+        );
+
+
+
+
+
+
+
+      const game =
+
+
+
+        String(
+
+
+
+          data.game ||
+
+
+
+          data.gameType ||
+
+
+
+          "ludo"
+
+
+
+        ).toLowerCase();
+
+
+
+
+
+
+
+      const betCoins =
+
+
+
+        Math.max(
+
+
+
+          0,
+
+
+
+          Number(
+
+
+
+            data.betCoins
+
+
+
+          ) || 0
+
+
+
+        );
+
+
+
+
+
+
+
+      if (
+
+
+
+        !userId ||
+
+
+
+        !userName
+
+
+
+      ) {
+
+
+
+        socket.emit(
+
+
+
+          "match_error",
+
+
+
+          {
+
+
+
+            message:
+
+
+
+              "User information missing hai."
+
+
+
+          }
+
+
+
+        );
+
+
+
+
+
+
+
+        return;
+
+
+
+      }
+
+
+
+
+
+
+
+      /*
+
+
+
+        Safety:
+
+
+
+        stale entry remove kar dete hain agar same
+
+
+
+        socket kisi purani queue state mein reh gaya ho.
+
+
+
+      */
+
+
+
+
+
+
+
+      waitingQueue =
+
+
+
+        waitingQueue.filter(
+
+
+
+          (player) => {
+
+
+
+            if (
+
+
+
+              player.socketId ===
+
+
+
+              socket.id
+
+
+
+            ) {
+
+
+
+              return false;
+
+
+
+            }
+
+
+
+
+
+
+
+            const oldSocket =
+
+
+
+              io.sockets.sockets.get(
+
+
+
+                player.socketId
+
+
+
+              );
+
+
+
+
+
+
+
+            return Boolean(oldSocket);
+
+
+
+          }
+
+
+
+        );
+
+
+
+
+
+
+
+      console.log(
+
+
+
+        `🔍 ${userName} | ${game} | ${betCoins} coins matchmaking queue mein aa gaya hai.`
+
+
+
+      );
+
+
+
+
+
+
+
+      // ----------------------------------------
+
+
+
+      // SAME GAME + SAME BET OPPONENT
+
+
+
+      // ----------------------------------------
+
+
+
+
+
+
+
+      const existingIndex =
+
+
+
+        waitingQueue.findIndex(
+
+
+
+          (player) =>
+
+
+
+            player.socketId !==
+
+
+
+              socket.id &&
+
+
+
+
+
+
+
+            normalizeId(
+
+
+
+              player.userId
+
+
+
+            ) !== userId &&
+
+
+
+
+
+
+
+            Number(
+
+
+
+              player.betCoins
+
+
+
+            ) === Number(
+
+
+
+              betCoins
+
+
+
+            ) &&
+
+
+
+
+
+
+
+            String(
+
+
+
+              player.game
+
+
+
+            ).toLowerCase() ===
+
+
+
+              game &&
+
+
+
+
+
+
+
+            io.sockets.sockets.has(
+
+
+
+              player.socketId
+
+
+
+            )
+
+
+
+        );
+
+
+
+
+
+
+
+      // ========================================
+
+
+
+      // MATCH FOUND
+
+
+
+      // ========================================
+
+
+
+
+
+
+
+      if (
+
+
+
+        existingIndex !== -1
+
+
+
+      ) {
+
+
+
+        const opponent =
+
+
+
+          waitingQueue.splice(
+
+
+
+            existingIndex,
+
+
+
+            1
+
+
+
+          )[0];
+
+
+
+
+
+
+
+        const opponentSocket =
+
+
+
+          io.sockets.sockets.get(
+
+
+
+            opponent.socketId
+
+
+
+          );
+
+
+
+
+
+
+
+        if (!opponentSocket) {
+
+
+
+          /*
+
+
+
+            Opponent stale nikla.
+
+
+
+            Current user ko queue mein daal do.
+
+
+
+          */
+
+
+
+
+
+
+
+          waitingQueue.push({
+
+
+
+            socketId:
+
+
+
+              socket.id,
+
+
+
+
+
+
+
+            userId,
+
+
+
+
+
+
+
+            userName,
+
+
+
+
+
+
+
+            game,
+
+
+
+
+
+
+
+            betCoins
+
+
+
+          });
+
+
+
+
+
+
+
+          socket.emit(
+
+
+
+            "waiting_for_opponent",
+
+
+
+            {
+
+
+
+              message:
+
+
+
+                "Opponent disconnect ho gaya. Naya opponent search ho raha hai...",
+
+
+
+
+
+
+
+              game,
+
+
+
+              betCoins
+
+
+
+            }
+
+
+
+          );
+
+
+
+
+
+
+
+          return;
+
+
+
+        }
+
+
+
+
+
+
+
+        const roomId =
+
+
+
+          makeRoomId(
+
+
+
+            "room",
+
+
+
+            socket.id,
+
+
+
+            opponent.socketId
+
+
+
+          );
+
+
+
+
+
+
+
+        /*
+
+
+
+          Both players join SAME ROOM.
+
+
+
+        */
+
+
+
+
+
+
+
+        socket.join(
+
+
+
+          roomId
+
+
+
+        );
+
+
+
+
+
+
+
+        opponentSocket.join(
+
+
+
+          roomId
+
+
+
+        );
+
+
+
+
+
+
+
+        /*
+
+
+
+          Ensure current player queue mein
+
+
+
+          duplicate na rahe.
+
+
+
+        */
+
+
+
+
+
+
+
+        removeFromQueue(
+
+
+
+          socket.id
+
+
+
+        );
+
+
+
+
+
+
+
+        const currentProfile =
+
+
+
+          onlinePlayers.get(
+
+
+
+            socket.id
+
+
+
+          );
+
+
+
+
+
+
+
+        const opponentProfile =
+
+
+
+          onlinePlayers.get(
+
+
+
+            opponent.socketId
+
+
+
+          );
+
+
+
+
+
+
+
+        const matchData = {
+
+
+
+          roomId,
+
+
+
+
+
+
+
+          game,
+
+
+
+
+
+
+
+          betCoins,
+
+
+
+
+
+
+
+          matchType:
+
+
+
+            "random",
+
+
+
+
+
+
+
+          player1: {
+
+
+
+            id:
+
+
+
+              userId,
+
+
+
+
+
+
+
+            userId,
+
+
+
+
+
+
+
+            name:
+
+
+
+              userName,
+
+
+
+
+
+
+
+            userName,
+
+
+
+
+
+
+
+            socketId:
+
+
+
+              socket.id,
+
+
+
+
+
+
+
+            profilePic:
+
+
+
+              (
+
+
+
+                currentProfile &&
+
+
+
+                currentProfile.profilePic
+
+
+
+              ) || ""
+
+
+
+          },
+
+
+
+
+
+
+
+          player2: {
+
+
+
+            id:
+
+
+
+              opponent.userId,
+
+
+
+
+
+
+
+            userId:
+
+
+
+              opponent.userId,
+
+
+
+
+
+
+
+            name:
+
+
+
+              opponent.userName,
+
+
+
+
+
+
+
+            userName:
+
+
+
+              opponent.userName,
+
+
+
+
+
+
+
+            socketId:
+
+
+
+              opponent.socketId,
+
+
+
+
+
+
+
+            profilePic:
+
+
+
+              (
+
+
+
+                opponentProfile &&
+
+
+
+                opponentProfile.profilePic
+
+
+
+              ) || ""
+
+
+
+          }
+
+
+
+        };
+
+
+
+
+
+
+
+        /*
+
+
+
+          MOST IMPORTANT:
+
+
+
+          SAME match_found event dono browsers ko.
+
+
+
+        */
+
+
+
+
+
+
+
+        io.to(
+
+
+
+          roomId
+
+
+
+        ).emit(
+
+
+
+          "match_found",
+
+
+
+          matchData
+
+
+
+        );
+
+
+
+
+
+
+
+        console.log(
+
+
+
+          `🎮 Match Start! ${game} | Room: ${roomId} | ${userName} VS ${opponent.userName} | Bet: ${betCoins}`
+
+
+
+        );
+
+
+
+
+
+
+
+        return;
+
+
+
+      }
+
+
+
+
+
+
+
+      // ========================================
+
+
+
+      // NO MATCH - WAIT
+
+
+
+      // ========================================
+
+
+
+
+
+
+
+      waitingQueue.push({
+
+
+
+        socketId:
+
+
+
+          socket.id,
+
+
+
+
+
+
+
+        userId,
+
+
+
+
+
+
+
+        userName,
+
+
+
+
+
+
+
+        game,
+
+
+
+
+
+
+
+        betCoins
+
+
+
+      });
+
+
+
+
+
+
+
+      socket.emit(
+
+
+
+        "waiting_for_opponent",
+
+
+
+        {
+
+
+
+          message:
+
+
+
+            "Opponent ki talash ki ja rahi hai...",
+
+
+
+
+
+
+
+          game,
+
+
+
+
+
+
+
+          betCoins
+
+
+
+        }
+
+
+
+      );
+
+
+
+
+
+
+
+      console.log(
+
+
+
+        `⏳ ${userName} ${game} ke liye queue mein wait kar raha hai.`
+
+
+
+      );
+
+
+
+    }
+
+
+
+  );
+
+
+
+
+
+
+
+  // ====================================================
+
+
+
+  // 8. CANCEL RANDOM MATCH
+
+
+
+  // ====================================================
+
+
+
+
+
+
+
+  socket.on(
+
+
+
+    "cancel_queue",
+
+
+
+    () => {
+
+
+
+      removeFromQueue(
+
+
+
+        socket.id
+
+
+
+      );
+
+
+
+
+
+
+
+      socket.emit(
+
+
+
+        "queue_cancelled",
+
+
+
+        {
+
+
+
+          message:
+
+
+
+            "Matchmaking cancel kar di gayi."
+
+
+
+        }
+
+
+
+      );
+
+
+
+
+
+
+
+      console.log(
+
+
+
+        `🚫 Matchmaking cancelled: ${socket.id}`
+
+
+
+      );
+
+
+
+    }
+
+
+
+  );
+
+
+
+
+
+
+
+  // ====================================================
+
+
+
+  // 9. GAME ROOM EVENTS
+
+
+
+  // ====================================================
+
+
+
+
+
+
+
+  socket.on(
+
+
+
+    "game_event",
+
+
+
+    (data = {}) => {
+
+
+
+      const {
+
+
+
+        roomId,
+
+
+
+        type,
+
+
+
+        payload
+
+
+
+      } = data;
+
+
+
+
+
+
+
+      if (
+
+
+
+        !roomId ||
+
+
+
+        !type
+
+
+
+      ) {
+
+
+
+        return;
+
+
+
+      }
+
+
+
+
+
+
+
+      /*
+
+
+
+        Security:
+
+
+
+        sender us room ka member hona chahiye.
+
+
+
+      */
+
+
+
+
+
+
+
+      if (
+
+
+
+        !socket.rooms.has(
+
+
+
+          roomId
+
+
+
+        )
+
+
+
+      ) {
+
+
+
+        socket.emit(
+
+
+
+          "realtime_error",
+
+
+
+          {
+
+
+
+            message:
+
+
+
+              "Aap is game room ka hissa nahi hain."
+
+
+
+          }
+
+
+
+        );
+
+
+
+
+
+
+
+        return;
+
+
+
+      }
+
+
+
+
+
+
+
+      /*
+
+
+
+        Sender ke ilawa room ke opponent
+
+
+
+        ko game action bhejo.
+
+
+
+      */
+
+
+
+
+
+
+
+      socket
+
+
+
+        .to(roomId)
+
+
+
+        .emit(
+
+
+
+          "game_event",
+
+
+
+          {
+
+
+
+            roomId,
+
+
+
+
+
+
+
+            type,
+
+
+
+
+
+
+
+            payload,
+
+
+
+
+
+
+
+            fromSocketId:
+
+
+
+              socket.id
+
+
+
+          }
+
+
+
+        );
+
+
+
+    }
+
+
+
+  );
+
+
+
+
+
+
+
+  // ====================================================
+
+
+
+  // 10. LEAVE GAME ROOM
+
+
+
+  // ====================================================
+
+
+
+
+
+
+
+  socket.on(
+
+
+
+    "leave_game_room",
+
+
+
+    (data = {}) => {
+
+
+
+      const roomId =
+
+
+
+        data.roomId;
+
+
+
+
+
+
+
+      if (
+
+
+
+        !roomId ||
+
+
+
+        !socket.rooms.has(
+
+
+
+          roomId
+
+
+
+        )
+
+
+
+      ) {
+
+
+
+        return;
+
+
+
+      }
+
+
+
+
+
+
+
+      socket
+
+
+
+        .to(roomId)
+
+
+
+        .emit(
+
+
+
+          "opponent_left_game",
+
+
+
+          {
+
+
+
+            socketId:
+
+
+
+              socket.id,
+
+
+
+
+
+
+
+            message:
+
+
+
+              "Opponent game se nikal gaya."
+
+
+
+          }
+
+
+
+        );
+
+
+
+
+
+
+
+      socket.leave(
+
+
+
+        roomId
+
+
+
+      );
+
+
+
+    }
+
+
+
+  );
+
+
+
+
+
+
+
+  // ====================================================
+
+
+
+  // 11. DISCONNECT
+
+
+
+  // ====================================================
+
+
+
+
+
+
+
+  socket.on(
+
+
+
+    "disconnect",
+
+
+
+    () => {
+
+
+
+      console.log(
+
+
+
+        "❌ User disconnect ho gaya:",
+
+
+
+        socket.id
+
+
+
+      );
+
+
+
+
+
+
+
+      // Matchmaking queue clean
+
+
+
+      removeFromQueue(
+
+
+
+        socket.id
+
+
+
+      );
+
+
+
+
+
+
+
+      const userId =
+
+
+
+        socketToUser.get(
+
+
+
+          socket.id
+
+
+
+        );
+
+
+
+
+
+
+
+      // Online players clean
+
+
+
+      onlinePlayers.delete(
+
+
+
+        socket.id
+
+
+
+      );
+
+
+
+
+
+
+
+      socketToUser.delete(
+
+
+
+        socket.id
+
+
+
+      );
+
+
+
+
+
+
+
+      /*
+
+
+
+        Is disconnected player ke pending
+
+
+
+        challenges bhi clean kar do.
+
+
+
+      */
+
+
+
+
+
+
+
+      for (
+
+
+
+        const [
+
+
+
+          challengeId,
+
+
+
+          challenge
+
+
+
+        ] of pendingChallenges
+
+
+
+      ) {
+
+
+
+        if (
+
+
+
+          normalizeId(
+
+
+
+            challenge.challengerUserId
+
+
+
+          ) === normalizeId(
+
+
+
+            userId
+
+
+
+          ) ||
+
+
+
+          normalizeId(
+
+
+
+            challenge.targetUserId
+
+
+
+          ) === normalizeId(
+
+
+
+            userId
+
+
+
+          )
+
+
+
+        ) {
+
+
+
+          pendingChallenges.delete(
+
+
+
+            challengeId
+
+
+
+          );
+
+
+
+        }
+
+
+
+      }
+
+
+
+
+
+
+
+      socket.broadcast.emit(
+
+
+
+        "player_offline",
+
+
+
+        {
+
+
+
+          userId:
+
+
+
+            userId || null,
+
+
+
+
+
+
+
+          socketId:
+
+
+
+            socket.id
+
+
+
+        }
+
+
+
+      );
+
+
+
+    }
+
+
+
+  );
 
 
 
@@ -9797,27 +9958,27 @@ io.on("connection", (socket) => {
 
 const LUCKY_DRAW_CHECK_INTERVAL =
 
-  60 * 1000;
+  60 * 1000;
 
 
 
 setInterval(async () => {
 
-  try {
+  try {
 
-    await getCurrentLuckyRound();
+    await getCurrentLuckyRound();
 
-  } catch (err) {
+  } catch (err) {
 
-    console.error(
+    console.error(
 
-      "Lucky Draw automatic round check error:",
+      "Lucky Draw automatic round check error:",
 
-      err
+      err
 
-    );
+    );
 
-  }
+  }
 
 }, LUCKY_DRAW_CHECK_INTERVAL);
 
@@ -9849,27 +10010,27 @@ setInterval(async () => {
 
 getCurrentLuckyRound()
 
-  .then((round) => {
+  .then((round) => {
 
-    console.log(
+    console.log(
 
-      `🎟️ Active Lucky Draw: ${round.roundId}`
+      `🎟️ Active Lucky Draw: ${round.roundId}`
 
-    );
+    );
 
-  })
+  })
 
-  .catch((err) => {
+  .catch((err) => {
 
-    console.error(
+    console.error(
 
-      "Lucky Draw startup error:",
+      "Lucky Draw startup error:",
 
-      err
+      err
 
-    );
+    );
 
-  });
+  });
 
 
 
@@ -9885,18 +10046,18 @@ getCurrentLuckyRound()
 
 server.listen(
 
-  PORT,
+  PORT,
 
-  "0.0.0.0",
+  "0.0.0.0",
 
-  () => {
+  () => {
 
-    console.log(
+    console.log(
 
-      `🚀 Server is running smoothly on port ${PORT}`
+      `🚀 Server is running smoothly on port ${PORT}`
 
-    );
+    );
 
-  }
+  }
 
 );
