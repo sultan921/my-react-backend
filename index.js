@@ -4563,6 +4563,95 @@ const socketToUser = new Map();
 
 const pendingChallenges = new Map();
 
+// Server-authoritative game turn clocks.
+// The browser only DISPLAYS this clock; the server owns the deadline.
+const gameRooms = new Map();
+const TURN_DURATION_MS = 40 * 1000;
+
+function createServerTurnState(roomId, player1, player2) {
+  const players = [player1, player2].filter(Boolean);
+  if (players.length < 2) return null;
+
+  // Server chooses once, so both browsers always get the same first turn.
+  const currentTurnIndex = crypto.randomInt(0, players.length);
+  const now = Date.now();
+  const state = {
+    roomId,
+    players: players.map((p) => ({
+      userId: normalizeId(p.userId || p.id),
+      socketId: p.socketId
+    })),
+    currentTurnIndex,
+    turnNumber: 1,
+    turnStartedAt: now,
+    turnEndsAt: now + TURN_DURATION_MS,
+    timer: null
+  };
+
+  gameRooms.set(roomId, state);
+  scheduleServerTurnTimeout(roomId);
+  return state;
+}
+
+function publicTurnState(state) {
+  if (!state) return null;
+  const current = state.players[state.currentTurnIndex];
+  return {
+    roomId: state.roomId,
+    currentTurnUserId: current?.userId || "",
+    currentTurnSocketId: current?.socketId || "",
+    turnNumber: state.turnNumber,
+    turnStartedAt: state.turnStartedAt,
+    turnEndsAt: state.turnEndsAt,
+    serverNow: Date.now(),
+    turnDurationMs: TURN_DURATION_MS
+  };
+}
+
+function scheduleServerTurnTimeout(roomId) {
+  const state = gameRooms.get(roomId);
+  if (!state) return;
+  if (state.timer) clearTimeout(state.timer);
+
+  const delay = Math.max(0, state.turnEndsAt - Date.now());
+  state.timer = setTimeout(() => {
+    const latest = gameRooms.get(roomId);
+    if (!latest) return;
+
+    const expiredPlayer = latest.players[latest.currentTurnIndex];
+    io.to(roomId).emit("turn_timeout", {
+      ...publicTurnState(latest),
+      expiredUserId: expiredPlayer?.userId || "",
+      expiredSocketId: expiredPlayer?.socketId || ""
+    });
+
+    advanceServerTurn(roomId, "timeout");
+  }, delay + 10);
+}
+
+function advanceServerTurn(roomId, reason = "move_complete") {
+  const state = gameRooms.get(roomId);
+  if (!state) return null;
+  if (state.timer) clearTimeout(state.timer);
+
+  state.currentTurnIndex = (state.currentTurnIndex + 1) % state.players.length;
+  state.turnNumber += 1;
+  state.turnStartedAt = Date.now();
+  state.turnEndsAt = state.turnStartedAt + TURN_DURATION_MS;
+
+  scheduleServerTurnTimeout(roomId);
+  const turn = publicTurnState(state);
+  io.to(roomId).emit("turn_state", { ...turn, reason });
+  return turn;
+}
+
+function destroyServerTurnState(roomId) {
+  const state = gameRooms.get(roomId);
+  if (state?.timer) clearTimeout(state.timer);
+  gameRooms.delete(roomId);
+}
+
+
 
 
 
@@ -7274,7 +7363,10 @@ io.on("connection", (socket) => {
 
 
 
-      io.to(roomId).emit(
+      const turnState = createServerTurnState(roomId, matchData.player1, matchData.player2);
+      if (turnState) Object.assign(matchData, publicTurnState(turnState));
+
+      io.to(roomId).emit(
 
 
 
@@ -8662,7 +8754,10 @@ io.on("connection", (socket) => {
 
 
 
-        io.to(
+        const turnState = createServerTurnState(roomId, matchData.player1, matchData.player2);
+        if (turnState) Object.assign(matchData, publicTurnState(turnState));
+
+        io.to(
 
 
 
@@ -8962,7 +9057,32 @@ io.on("connection", (socket) => {
 
 
 
-  // 9. GAME ROOM EVENTS
+  // 8B. SERVER-AUTHORITATIVE TURN/TIMER EVENTS
+  socket.on("request_turn_state", ({ roomId } = {}) => {
+    if (!roomId || !socket.rooms.has(roomId)) return;
+    const state = gameRooms.get(roomId);
+    if (state) socket.emit("turn_state", { ...publicTurnState(state), reason: "sync" });
+  });
+
+  socket.on("end_turn", ({ roomId, turnNumber } = {}) => {
+    if (!roomId || !socket.rooms.has(roomId)) return;
+    const state = gameRooms.get(roomId);
+    if (!state) return;
+
+    const current = state.players[state.currentTurnIndex];
+    if (current?.socketId !== socket.id) {
+      socket.emit("realtime_error", { message: "Abhi aapki turn nahi hai." });
+      return;
+    }
+    if (Number(turnNumber) !== state.turnNumber) {
+      socket.emit("turn_state", { ...publicTurnState(state), reason: "stale_turn_rejected" });
+      return;
+    }
+    advanceServerTurn(roomId, "player_finished");
+  });
+
+  // ====================================================
+  // 9. GAME ROOM EVENTS
 
 
 
@@ -9427,6 +9547,13 @@ io.on("connection", (socket) => {
 
 
       );
+
+      for (const [roomId, state] of gameRooms.entries()) {
+        if (state.players.some((p) => p.socketId === socket.id)) {
+          socket.to(roomId).emit("opponent_disconnected", { socketId: socket.id });
+          destroyServerTurnState(roomId);
+        }
+      }
 
 
 
