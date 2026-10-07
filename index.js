@@ -4851,6 +4851,9 @@ const socketToUser = new Map();
 
 const pendingChallenges = new Map();
 
+// Active game room membership survives Socket.IO reconnects.
+const activeGameRooms = new Map();
+
 
 
 
@@ -7562,6 +7565,11 @@ io.on("connection", (socket) => {
 
 
 
+      activeGameRooms.set(String(roomId), new Set([
+        normalizeId(challenger.userId),
+        normalizeId(acceptingPlayer.userId)
+      ]));
+
       io.to(roomId).emit(
 
 
@@ -8930,6 +8938,11 @@ io.on("connection", (socket) => {
 
 
 
+        activeGameRooms.set(String(roomId), new Set([
+          normalizeId(userId),
+          normalizeId(opponent.userId)
+        ]));
+
         /*
 
 
@@ -9260,6 +9273,38 @@ io.on("connection", (socket) => {
 
 
 
+
+
+  socket.on("rejoin_game_room", (data = {}) => {
+    const roomId = String(data.roomId || "").trim();
+    const userId = normalizeId(data.userId);
+
+    if (!roomId || !userId) {
+      return;
+    }
+
+    const allowedUsers = activeGameRooms.get(roomId);
+
+    if (!allowedUsers || !allowedUsers.has(userId)) {
+      socket.emit("realtime_error", {
+        message: "Game room reconnect verify nahi ho saka."
+      });
+      return;
+    }
+
+    socket.join(roomId);
+    socketToUser.set(socket.id, userId);
+
+    socket.emit("game_room_rejoined", {
+      roomId,
+      serverNow: Date.now()
+    });
+
+    socket.to(roomId).emit("opponent_reconnected", {
+      roomId,
+      userId
+    });
+  });
 
 
   socket.on(
@@ -9639,6 +9684,8 @@ io.on("connection", (socket) => {
 
 
       );
+
+      activeGameRooms.delete(String(roomId));
 
 
 
