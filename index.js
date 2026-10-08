@@ -429,6 +429,202 @@ const Deposit =
   mongoose.models.Deposit ||
   mongoose.model("Deposit", depositSchema);
 
+
+// ======================================================
+// REAL NOTIFICATION CENTER - PERSISTENT + REALTIME
+// ======================================================
+
+const appNotificationSchema = new mongoose.Schema(
+  {
+    recipientUserId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      required: true,
+      index: true
+    },
+    senderUserId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      default: null,
+      index: true
+    },
+    senderName: {
+      type: String,
+      default: "",
+      trim: true,
+      maxlength: 120
+    },
+    type: {
+      type: String,
+      enum: [
+        "friend_request",
+        "friend_response",
+        "challenge",
+        "challenge_accepted",
+        "challenge_rejected",
+        "deposit_approved",
+        "deposit_rejected",
+        "admin_message",
+        "message",
+        "system"
+      ],
+      default: "system",
+      index: true
+    },
+    title: {
+      type: String,
+      required: true,
+      trim: true,
+      maxlength: 120
+    },
+    message: {
+      type: String,
+      required: true,
+      trim: true,
+      maxlength: 1200
+    },
+    data: {
+      type: mongoose.Schema.Types.Mixed,
+      default: {}
+    },
+    read: {
+      type: Boolean,
+      default: false,
+      index: true
+    },
+    actionStatus: {
+      type: String,
+      enum: ["none", "pending", "accepted", "rejected", "opened"],
+      default: "none",
+      index: true
+    },
+    sourceKey: {
+      type: String,
+      default: "",
+      trim: true,
+      index: true
+    }
+  },
+  {
+    timestamps: true
+  }
+);
+
+appNotificationSchema.index({
+  recipientUserId: 1,
+  createdAt: -1
+});
+
+const AppNotification =
+  mongoose.models.AppNotification ||
+  mongoose.model("AppNotification", appNotificationSchema);
+
+const friendshipSchema = new mongoose.Schema(
+  {
+    pairKey: {
+      type: String,
+      required: true,
+      unique: true,
+      index: true
+    },
+    users: [
+      {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "User",
+        required: true
+      }
+    ],
+    acceptedAt: {
+      type: Date,
+      default: Date.now
+    }
+  },
+  {
+    timestamps: true
+  }
+);
+
+const Friendship =
+  mongoose.models.Friendship ||
+  mongoose.model("Friendship", friendshipSchema);
+
+function notificationRoom(userId) {
+  return `notifications:${String(userId || "")}`;
+}
+
+function serializeNotification(notification) {
+  const item =
+    typeof notification?.toObject === "function"
+      ? notification.toObject()
+      : notification || {};
+
+  return {
+    id: String(item._id || item.id || ""),
+    recipientUserId: String(item.recipientUserId || ""),
+    senderUserId: item.senderUserId ? String(item.senderUserId) : "",
+    senderName: item.senderName || "",
+    type: item.type || "system",
+    title: item.title || "Notification",
+    message: item.message || "",
+    data: item.data || {},
+    read: Boolean(item.read),
+    actionStatus: item.actionStatus || "none",
+    sourceKey: item.sourceKey || "",
+    createdAt: item.createdAt || new Date().toISOString(),
+    updatedAt: item.updatedAt || item.createdAt || new Date().toISOString()
+  };
+}
+
+async function createAndPushNotification({
+  recipientUserId,
+  senderUserId = null,
+  senderName = "",
+  type = "system",
+  title,
+  message,
+  data = {},
+  actionStatus = "none",
+  sourceKey = ""
+}) {
+  if (
+    !recipientUserId ||
+    !mongoose.Types.ObjectId.isValid(String(recipientUserId))
+  ) {
+    return null;
+  }
+
+  const notification = await AppNotification.create({
+    recipientUserId,
+    senderUserId:
+      senderUserId &&
+      mongoose.Types.ObjectId.isValid(String(senderUserId))
+        ? senderUserId
+        : null,
+    senderName: String(senderName || "").slice(0, 120),
+    type,
+    title: String(title || "Notification").slice(0, 120),
+    message: String(message || "").slice(0, 1200),
+    data,
+    read: false,
+    actionStatus,
+    sourceKey: String(sourceKey || "").slice(0, 300)
+  });
+
+  const payload = serializeNotification(notification);
+
+  io.to(notificationRoom(recipientUserId)).emit(
+    "notification:new",
+    payload
+  );
+
+  return payload;
+}
+
+function canonicalFriendPair(userA, userB) {
+  return [String(userA), String(userB)].sort().join(":");
+}
+
+
 // ------------------------------------------------------
 // ADMIN SECURITY - PRIVATE BACKEND TOKEN SYSTEM
 // ------------------------------------------------------
@@ -603,6 +799,444 @@ async function requireUserSession(req, res, next) {
     });
   }
 }
+
+
+// ======================================================
+// NOTIFICATION CENTER API
+// ======================================================
+
+app.get("/api/notifications", requireUserSession, async (req, res) => {
+  try {
+    const limit = Math.min(
+      100,
+      Math.max(1, Number.parseInt(req.query.limit, 10) || 60)
+    );
+
+    const [notifications, unreadCount] = await Promise.all([
+      AppNotification.find({
+        recipientUserId: req.authUser._id
+      })
+        .sort({ createdAt: -1 })
+        .limit(limit)
+        .lean(),
+
+      AppNotification.countDocuments({
+        recipientUserId: req.authUser._id,
+        read: false
+      })
+    ]);
+
+    return res.status(200).json({
+      success: true,
+      unreadCount,
+      notifications: notifications.map(serializeNotification)
+    });
+  } catch (err) {
+    console.error("Notification list error:", err);
+    return res.status(500).json({
+      success: false,
+      error: "Notifications load nahi ho sake."
+    });
+  }
+});
+
+app.patch(
+  "/api/notifications/:notificationId/read",
+  requireUserSession,
+  async (req, res) => {
+    try {
+      const notificationId = String(req.params.notificationId || "");
+
+      if (!mongoose.Types.ObjectId.isValid(notificationId)) {
+        return res.status(400).json({
+          success: false,
+          error: "Invalid notification ID."
+        });
+      }
+
+      const notification = await AppNotification.findOneAndUpdate(
+        {
+          _id: notificationId,
+          recipientUserId: req.authUser._id
+        },
+        {
+          $set: { read: true }
+        },
+        {
+          new: true
+        }
+      );
+
+      if (!notification) {
+        return res.status(404).json({
+          success: false,
+          error: "Notification nahi mila."
+        });
+      }
+
+      return res.status(200).json({
+        success: true,
+        notification: serializeNotification(notification)
+      });
+    } catch (err) {
+      console.error("Notification read error:", err);
+      return res.status(500).json({
+        success: false,
+        error: "Notification read save nahi ho saka."
+      });
+    }
+  }
+);
+
+app.post(
+  "/api/notifications/mark-all-read",
+  requireUserSession,
+  async (req, res) => {
+    try {
+      await AppNotification.updateMany(
+        {
+          recipientUserId: req.authUser._id,
+          read: false
+        },
+        {
+          $set: { read: true }
+        }
+      );
+
+      return res.status(200).json({ success: true });
+    } catch (err) {
+      console.error("Mark notifications read error:", err);
+      return res.status(500).json({
+        success: false,
+        error: "Notifications update nahi ho sake."
+      });
+    }
+  }
+);
+
+app.delete(
+  "/api/notifications/:notificationId",
+  requireUserSession,
+  async (req, res) => {
+    try {
+      const notificationId = String(req.params.notificationId || "");
+
+      if (!mongoose.Types.ObjectId.isValid(notificationId)) {
+        return res.status(400).json({
+          success: false,
+          error: "Invalid notification ID."
+        });
+      }
+
+      const deleted = await AppNotification.findOneAndDelete({
+        _id: notificationId,
+        recipientUserId: req.authUser._id
+      });
+
+      if (!deleted) {
+        return res.status(404).json({
+          success: false,
+          error: "Notification nahi mila."
+        });
+      }
+
+      return res.status(200).json({ success: true });
+    } catch (err) {
+      console.error("Notification delete error:", err);
+      return res.status(500).json({
+        success: false,
+        error: "Notification delete nahi ho saka."
+      });
+    }
+  }
+);
+
+app.post(
+  "/api/notifications/:notificationId/action",
+  requireUserSession,
+  async (req, res) => {
+    try {
+      const notificationId = String(req.params.notificationId || "");
+      const action = String(req.body.action || "").trim().toLowerCase();
+
+      if (!mongoose.Types.ObjectId.isValid(notificationId)) {
+        return res.status(400).json({
+          success: false,
+          error: "Invalid notification ID."
+        });
+      }
+
+      const notification = await AppNotification.findOne({
+        _id: notificationId,
+        recipientUserId: req.authUser._id
+      });
+
+      if (!notification) {
+        return res.status(404).json({
+          success: false,
+          error: "Notification nahi mila."
+        });
+      }
+
+      if (notification.type === "friend_request") {
+        if (!["accept", "reject"].includes(action)) {
+          return res.status(400).json({
+            success: false,
+            error: "Friend request ke liye accept ya reject use karein."
+          });
+        }
+
+        if (notification.actionStatus !== "pending") {
+          return res.status(409).json({
+            success: false,
+            error: "Is friend request par pehle hi action ho chuka hai."
+          });
+        }
+
+        const senderUserId =
+          notification.senderUserId ||
+          notification.data?.senderUserId;
+
+        if (
+          action === "accept" &&
+          senderUserId &&
+          mongoose.Types.ObjectId.isValid(String(senderUserId))
+        ) {
+          const pairKey = canonicalFriendPair(
+            req.authUser._id,
+            senderUserId
+          );
+
+          await Friendship.findOneAndUpdate(
+            { pairKey },
+            {
+              $setOnInsert: {
+                pairKey,
+                users: [req.authUser._id, senderUserId],
+                acceptedAt: new Date()
+              }
+            },
+            {
+              upsert: true,
+              new: true
+            }
+          );
+        }
+
+        notification.actionStatus =
+          action === "accept" ? "accepted" : "rejected";
+        notification.read = true;
+        await notification.save();
+
+        if (
+          senderUserId &&
+          mongoose.Types.ObjectId.isValid(String(senderUserId))
+        ) {
+          await createAndPushNotification({
+            recipientUserId: senderUserId,
+            senderUserId: req.authUser._id,
+            senderName: req.authUser.name,
+            type: "friend_response",
+            title:
+              action === "accept"
+                ? "Friend request accepted"
+                : "Friend request declined",
+            message:
+              action === "accept"
+                ? `${req.authUser.name} accepted your friend request.`
+                : `${req.authUser.name} declined your friend request.`,
+            data: {
+              friendUserId: String(req.authUser._id),
+              result: action
+            },
+            actionStatus:
+              action === "accept" ? "accepted" : "rejected"
+          });
+        }
+
+        return res.status(200).json({
+          success: true,
+          actionStatus: notification.actionStatus,
+          notification: serializeNotification(notification)
+        });
+      }
+
+      if (notification.type === "challenge") {
+        if (action !== "open") {
+          return res.status(400).json({
+            success: false,
+            error: "Challenge notification ko Open Game se kholen."
+          });
+        }
+
+        notification.actionStatus = "opened";
+        notification.read = true;
+        await notification.save();
+
+        return res.status(200).json({
+          success: true,
+          actionStatus: "opened",
+          data: notification.data || {}
+        });
+      }
+
+      notification.read = true;
+      await notification.save();
+
+      return res.status(200).json({
+        success: true,
+        notification: serializeNotification(notification)
+      });
+    } catch (err) {
+      console.error("Notification action error:", err);
+      return res.status(500).json({
+        success: false,
+        error: "Notification action complete nahi ho saka."
+      });
+    }
+  }
+);
+
+app.get("/api/friends", requireUserSession, async (req, res) => {
+  try {
+    const friendships = await Friendship.find({
+      users: req.authUser._id
+    })
+      .sort({ acceptedAt: -1 })
+      .lean();
+
+    const friendIds = friendships
+      .flatMap((item) => item.users || [])
+      .map(String)
+      .filter((id) => id !== String(req.authUser._id));
+
+    const friends = await User.find({
+      _id: { $in: friendIds }
+    })
+      .select("_id name phone")
+      .lean();
+
+    return res.status(200).json({
+      success: true,
+      friends: friends.map((friend) => ({
+        id: String(friend._id),
+        name: friend.name,
+        phone: friend.phone
+      }))
+    });
+  } catch (err) {
+    console.error("Friends list error:", err);
+    return res.status(500).json({
+      success: false,
+      error: "Friends load nahi ho sake."
+    });
+  }
+});
+
+app.post(
+  "/api/admin/notifications/broadcast",
+  requireUserSession,
+  async (req, res) => {
+    try {
+      if (!isAdminPhone(req.authUser.phone)) {
+        return res.status(403).json({
+          success: false,
+          error: "Sirf admin notification send kar sakta hai."
+        });
+      }
+
+      const target = String(req.body.target || "all").trim().toLowerCase();
+      const phone = String(req.body.phone || "").trim();
+      const title = String(req.body.title || "").trim().slice(0, 120);
+      const message = String(req.body.message || "").trim().slice(0, 1200);
+      const priority =
+        String(req.body.priority || "important").toLowerCase() === "normal"
+          ? "normal"
+          : "important";
+
+      if (!title || !message) {
+        return res.status(400).json({
+          success: false,
+          error: "Title aur message required hain."
+        });
+      }
+
+      let users = [];
+
+      if (target === "specific") {
+        if (!phone) {
+          return res.status(400).json({
+            success: false,
+            error: "Specific user ke liye phone number required hai."
+          });
+        }
+
+        const normalizedPhone = normalizeAdminPhone(phone);
+
+        const user = await User.findOne({
+          $or: [{ phone }, { phone: normalizedPhone }]
+        })
+          .select("_id")
+          .lean();
+
+        if (!user) {
+          return res.status(404).json({
+            success: false,
+            error: "Is phone number ka user nahi mila."
+          });
+        }
+
+        users = [user];
+      } else {
+        users = await User.find({}).select("_id").lean();
+      }
+
+      if (users.length === 0) {
+        return res.status(200).json({
+          success: true,
+          sentCount: 0
+        });
+      }
+
+      const sourceKey = `admin_${Date.now()}`;
+      const docs = users.map((targetUser) => ({
+        recipientUserId: targetUser._id,
+        senderUserId: req.authUser._id,
+        senderName: "SAMATKAAR",
+        type: "admin_message",
+        title,
+        message,
+        data: { priority },
+        read: false,
+        actionStatus: "none",
+        sourceKey
+      }));
+
+      const inserted = await AppNotification.insertMany(docs);
+
+      for (const notification of inserted) {
+        io.to(
+          notificationRoom(notification.recipientUserId)
+        ).emit(
+          "notification:new",
+          serializeNotification(notification)
+        );
+      }
+
+      return res.status(201).json({
+        success: true,
+        sentCount: inserted.length
+      });
+    } catch (err) {
+      console.error("Admin broadcast error:", err);
+      return res.status(500).json({
+        success: false,
+        error: "Admin notification send nahi ho saka."
+      });
+    }
+  }
+);
+
 
 function createAdminToken(user) {
   const secret = getAdminSigningSecret();
@@ -1129,6 +1763,22 @@ app.post(
         };
       });
 
+      if (responseData?.user?.id) {
+        await createAndPushNotification({
+          recipientUserId: responseData.user.id,
+          senderName: "SAMATKAAR",
+          type: "deposit_approved",
+          title: "Deposit approved",
+          message: `${responseData.coinsCredited} coins have been added to your wallet.`,
+          data: {
+            depositId: String(responseData.depositId || ""),
+            amountPKR: responseData.amountPKR,
+            coinsCredited: responseData.coinsCredited
+          },
+          sourceKey: `deposit_${responseData.depositId}_approved`
+        });
+      }
+
       return res.status(200).json({
         success: true,
         message: "Deposit approved. Coins successfully credit ho gaye.",
@@ -1197,6 +1847,21 @@ app.post(
           status: existing.status
         });
       }
+
+      await createAndPushNotification({
+        recipientUserId: deposit.userId,
+        senderName: "SAMATKAAR",
+        type: "deposit_rejected",
+        title: "Deposit not approved",
+        message:
+          deposit.rejectionReason ||
+          "Your payment could not be verified.",
+        data: {
+          depositId: String(deposit._id),
+          reason: deposit.rejectionReason
+        },
+        sourceKey: `deposit_${deposit._id}_rejected`
+      });
 
       return res.status(200).json({
         success: true,
@@ -5305,6 +5970,48 @@ io.on("connection", (socket) => {
 
 
 
+
+  // ====================================================
+  // NOTIFICATION SOCKET - AUTHENTICATED PRIVATE ROOM
+  // ====================================================
+  socket.on("notification:subscribe", async (data = {}) => {
+    try {
+      const payload = verifyUserSessionToken(data.token);
+
+      if (
+        !payload ||
+        !payload.sub ||
+        !mongoose.Types.ObjectId.isValid(String(payload.sub))
+      ) {
+        socket.emit("notification:error", {
+          message: "Notification session invalid hai."
+        });
+        return;
+      }
+
+      const exists = await User.exists({ _id: payload.sub });
+
+      if (!exists) {
+        socket.emit("notification:error", {
+          message: "Notification user nahi mila."
+        });
+        return;
+      }
+
+      socket.join(notificationRoom(payload.sub));
+      socket.data.notificationUserId = String(payload.sub);
+
+      socket.emit("notification:subscribed", {
+        success: true
+      });
+    } catch (err) {
+      console.error("Notification subscribe error:", err);
+      socket.emit("notification:error", {
+        message: "Notification realtime connect nahi ho saka."
+      });
+    }
+  });
+
   // 1. REGISTER PLAYER AS ONLINE
 
 
@@ -6217,45 +6924,73 @@ io.on("connection", (socket) => {
 
 
       if (!target) {
+        // Friend requests are allowed even if the other user is offline.
+        // The request is stored permanently and will appear when they log in.
+        if (!mongoose.Types.ObjectId.isValid(String(targetUserId || ""))) {
+          socket.emit("friend_request_error", {
+            message: "Invalid player."
+          });
+          return;
+        }
 
+        User.findById(targetUserId)
+          .select("_id name")
+          .lean()
+          .then(async (targetUser) => {
+            if (!targetUser) {
+              socket.emit("friend_request_error", {
+                message: "Yeh player nahi mila."
+              });
+              return;
+            }
 
+            if (String(targetUser._id) === String(sender.userId)) {
+              socket.emit("friend_request_error", {
+                message: "Aap khud ko friend request nahi bhej sakte."
+              });
+              return;
+            }
 
-        socket.emit(
+            const alreadyPending = await AppNotification.findOne({
+              recipientUserId: targetUser._id,
+              senderUserId: sender.userId,
+              type: "friend_request",
+              actionStatus: "pending"
+            }).lean();
 
+            if (!alreadyPending) {
+              await createAndPushNotification({
+                recipientUserId: targetUser._id,
+                senderUserId: sender.userId,
+                senderName: sender.userName,
+                type: "friend_request",
+                title: "New friend request",
+                message: `${sender.userName} wants to add you as a friend.`,
+                data: {
+                  senderUserId: String(sender.userId),
+                  senderName: sender.userName,
+                  profilePic: sender.profilePic || ""
+                },
+                actionStatus: "pending",
+                sourceKey: `friend_${sender.userId}_${targetUser._id}`
+              });
+            }
 
-
-          "friend_request_error",
-
-
-
-          {
-
-
-
-            message:
-
-
-
-              "Yeh player abhi online nahi hai."
-
-
-
-          }
-
-
-
-        );
-
-
-
-
-
-
+            socket.emit("friend_request_sent", {
+              success: true,
+              targetUserId: String(targetUser._id),
+              offline: true,
+              message: "Friend request send ho gayi. User ko login par notification mil jayegi."
+            });
+          })
+          .catch((err) => {
+            console.error("Offline friend request error:", err);
+            socket.emit("friend_request_error", {
+              message: "Friend request send nahi ho saki."
+            });
+          });
 
         return;
-
-
-
       }
 
 
@@ -6311,6 +7046,24 @@ io.on("connection", (socket) => {
 
 
 
+
+      createAndPushNotification({
+        recipientUserId: target.userId,
+        senderUserId: sender.userId,
+        senderName: sender.userName,
+        type: "friend_request",
+        title: "New friend request",
+        message: `${sender.userName} wants to add you as a friend.`,
+        data: {
+          senderUserId: String(sender.userId),
+          senderName: sender.userName,
+          profilePic: sender.profilePic || ""
+        },
+        actionStatus: "pending",
+        sourceKey: `friend_${sender.userId}_${target.userId}_${Date.now()}`
+      }).catch((err) => {
+        console.error("Friend notification save error:", err);
+      });
 
       io.to(target.socketId).emit(
 
@@ -6849,6 +7602,26 @@ io.on("connection", (socket) => {
 
 
 
+
+      createAndPushNotification({
+        recipientUserId: target.userId,
+        senderUserId: sender.userId,
+        senderName: sender.userName,
+        type: "challenge",
+        title: "New game challenge",
+        message: `${sender.userName} challenged you to ${game === "pool" ? "8 Ball Pool" : "Ludo"}${betCoins > 0 ? ` for ${betCoins} coins` : ""}.`,
+        data: {
+          challengeId,
+          challengerUserId: String(sender.userId),
+          challengerName: sender.userName,
+          game,
+          betCoins
+        },
+        actionStatus: "pending",
+        sourceKey: challengeId
+      }).catch((err) => {
+        console.error("Challenge notification save error:", err);
+      });
 
       // Opponent ko challenge bhejo
 
@@ -7851,6 +8624,43 @@ io.on("connection", (socket) => {
 
 
 
+      if (data.challengeId) {
+        AppNotification.updateMany(
+          {
+            recipientUserId: acceptingPlayer.userId,
+            type: "challenge",
+            sourceKey: data.challengeId
+          },
+          {
+            $set: {
+              read: true,
+              actionStatus: "accepted"
+            }
+          }
+        ).catch((err) => {
+          console.error("Challenge notification accept sync error:", err);
+        });
+      }
+
+      createAndPushNotification({
+        recipientUserId: challenger.userId,
+        senderUserId: acceptingPlayer.userId,
+        senderName: acceptingPlayer.userName,
+        type: "challenge_accepted",
+        title: "Challenge accepted",
+        message: `${acceptingPlayer.userName} accepted your ${game === "pool" ? "8 Ball Pool" : "Ludo"} challenge.`,
+        data: {
+          roomId,
+          game,
+          betCoins,
+          challengeId: data.challengeId || ""
+        },
+        actionStatus: "accepted",
+        sourceKey: data.challengeId || String(roomId)
+      }).catch((err) => {
+        console.error("Challenge accepted notification error:", err);
+      });
+
       console.log(
 
 
@@ -8070,6 +8880,44 @@ io.on("connection", (socket) => {
 
 
 
+
+      const rejectingPlayer = onlinePlayers.get(socket.id);
+
+      if (data.challengeId && rejectingPlayer) {
+        AppNotification.updateMany(
+          {
+            recipientUserId: rejectingPlayer.userId,
+            type: "challenge",
+            sourceKey: data.challengeId
+          },
+          {
+            $set: {
+              read: true,
+              actionStatus: "rejected"
+            }
+          }
+        ).catch((err) => {
+          console.error("Challenge notification reject sync error:", err);
+        });
+      }
+
+      if (challenger && rejectingPlayer) {
+        createAndPushNotification({
+          recipientUserId: challenger.userId,
+          senderUserId: rejectingPlayer.userId,
+          senderName: rejectingPlayer.userName,
+          type: "challenge_rejected",
+          title: "Challenge declined",
+          message: `${rejectingPlayer.userName} declined your game challenge.`,
+          data: {
+            challengeId: data.challengeId || ""
+          },
+          actionStatus: "rejected",
+          sourceKey: data.challengeId || ""
+        }).catch((err) => {
+          console.error("Challenge rejected notification error:", err);
+        });
+      }
 
       socket.emit(
 
