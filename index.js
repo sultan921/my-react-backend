@@ -475,6 +475,135 @@ function getAdminSigningSecret() {
   return String(process.env.ADMIN_DEPOSIT_KEY || "");
 }
 
+const USER_SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+
+function getUserSessionSecret() {
+  // USER_SESSION_SECRET is preferred. ADMIN_DEPOSIT_KEY is a compatibility
+  // fallback so the persistence fix works immediately with the current Railway setup.
+  return String(
+    process.env.USER_SESSION_SECRET ||
+    process.env.ADMIN_DEPOSIT_KEY ||
+    ""
+  );
+}
+
+function createUserSessionToken(user) {
+  const secret = getUserSessionSecret();
+
+  if (!secret) {
+    throw new Error(
+      "USER_SESSION_SECRET ya ADMIN_DEPOSIT_KEY server par configure nahi hai."
+    );
+  }
+
+  const payload = {
+    sub: String(user._id),
+    phone: String(user.phone || ""),
+    exp: Date.now() + USER_SESSION_TTL_MS
+  };
+
+  const encodedPayload = Buffer.from(
+    JSON.stringify(payload)
+  ).toString("base64url");
+
+  const signature = crypto
+    .createHmac("sha256", secret)
+    .update(encodedPayload)
+    .digest("base64url");
+
+  return `${encodedPayload}.${signature}`;
+}
+
+function verifyUserSessionToken(token) {
+  const secret = getUserSessionSecret();
+
+  if (!secret || !token) {
+    return null;
+  }
+
+  const parts = String(token).split(".");
+
+  if (parts.length !== 2) {
+    return null;
+  }
+
+  const [encodedPayload, suppliedSignature] = parts;
+
+  const expectedSignature = crypto
+    .createHmac("sha256", secret)
+    .update(encodedPayload)
+    .digest("base64url");
+
+  const expectedBuffer = Buffer.from(expectedSignature);
+  const suppliedBuffer = Buffer.from(suppliedSignature);
+
+  if (
+    expectedBuffer.length !== suppliedBuffer.length ||
+    !crypto.timingSafeEqual(expectedBuffer, suppliedBuffer)
+  ) {
+    return null;
+  }
+
+  try {
+    const payload = JSON.parse(
+      Buffer.from(encodedPayload, "base64url").toString("utf8")
+    );
+
+    if (
+      !payload ||
+      !payload.sub ||
+      !payload.exp ||
+      Number(payload.exp) <= Date.now()
+    ) {
+      return null;
+    }
+
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
+async function requireUserSession(req, res, next) {
+  try {
+    const authorization = String(
+      req.headers.authorization || ""
+    );
+
+    const token = authorization.startsWith("Bearer ")
+      ? authorization.slice(7).trim()
+      : "";
+
+    const payload = verifyUserSessionToken(token);
+
+    if (!payload || !mongoose.Types.ObjectId.isValid(payload.sub)) {
+      return res.status(401).json({
+        success: false,
+        error: "User session invalid ya expire ho chuki hai."
+      });
+    }
+
+    const user = await User.findById(payload.sub);
+
+    if (!user) {
+      return res.status(401).json({
+        success: false,
+        error: "User account nahi mila."
+      });
+    }
+
+    req.authUser = user;
+    next();
+  } catch (err) {
+    console.error("User session verification error:", err);
+
+    return res.status(500).json({
+      success: false,
+      error: "User session verify nahi ho saki."
+    });
+  }
+}
+
 function createAdminToken(user) {
   const secret = getAdminSigningSecret();
 
@@ -4531,6 +4660,8 @@ app.post("/api/auth/signup", async (req, res) => {
 
 
 
+      token: createUserSessionToken(newUser),
+
       user: {
 
 
@@ -4692,6 +4823,8 @@ app.post("/api/auth/login", async (req, res) => {
 
 
 
+      token: createUserSessionToken(user),
+
       user: {
 
 
@@ -4747,6 +4880,90 @@ app.post("/api/auth/login", async (req, res) => {
 
 
 
+
+
+
+// ======================================================
+// USER BALANCE PERSISTENCE
+// ======================================================
+// These endpoints fix the old logout/login reset bug.
+// The authenticated user is resolved from a signed server token;
+// phone number from the request body is NOT trusted.
+// ======================================================
+
+app.get("/api/user/me", requireUserSession, async (req, res) => {
+  try {
+    const user = req.authUser;
+
+    return res.status(200).json({
+      success: true,
+      user: {
+        id: user._id,
+        name: user.name,
+        phone: user.phone,
+        coins: Number(user.coins || 0),
+        role: isAdminPhone(user.phone) ? "admin" : "user"
+      }
+    });
+  } catch (err) {
+    console.error("Get current user error:", err);
+
+    return res.status(500).json({
+      success: false,
+      error: "Account balance load nahi ho saka."
+    });
+  }
+});
+
+app.post("/api/user/update-coins", requireUserSession, async (req, res) => {
+  try {
+    const requestedCoins = Number(req.body.coins);
+
+    if (
+      !Number.isFinite(requestedCoins) ||
+      !Number.isInteger(requestedCoins) ||
+      requestedCoins < 0 ||
+      requestedCoins > 1000000000
+    ) {
+      return res.status(400).json({
+        success: false,
+        error: "Invalid coins balance."
+      });
+    }
+
+    const updatedUser = await User.findByIdAndUpdate(
+      req.authUser._id,
+      {
+        $set: {
+          coins: requestedCoins
+        }
+      },
+      {
+        new: true,
+        runValidators: true
+      }
+    );
+
+    if (!updatedUser) {
+      return res.status(404).json({
+        success: false,
+        error: "User account nahi mila."
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      coins: Number(updatedUser.coins || 0)
+    });
+  } catch (err) {
+    console.error("Update coins error:", err);
+
+    return res.status(500).json({
+      success: false,
+      error: "Coins save nahi ho sake."
+    });
+  }
+});
 
 
 // ==========================
